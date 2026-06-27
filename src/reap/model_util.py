@@ -115,7 +115,23 @@ MODEL_ATTRS = {
         "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
+    "DeepseekV4ForCausalLM": {
+        "moe_block": "mlp",
+        "gate_proj": "gate_proj",
+        "up_proj": "up_proj",
+        "down_proj": "down_proj",
+        "experts": "experts",
+        "fused": False,
+        "router": "gate",
+        "num_experts": "num_local_experts",
+        "num_experts_per_tok": "num_experts_per_tok",
+    },
 }
+
+
+def _is_v4_model(model) -> bool:
+    """Check if model is a DeepSeek V4 variant by class name."""
+    return "DeepseekV4" in model.__class__.__name__
 
 
 def get_moe(model, layer):
