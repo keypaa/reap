@@ -18,10 +18,13 @@ except ImportError:
 
 class TestFP4Dequantize:
     def test_fp4_dequantize_shape(self):
-        packed = torch.tensor([[0x01, 0x23], [0x45, 0x67]], dtype=torch.int8)
-        scales = torch.tensor([[2.0, 4.0]], dtype=torch.float32)
+        packed = torch.zeros(2, 16, dtype=torch.int8)
+        packed[0, :2] = torch.tensor([0x01, 0x23], dtype=torch.int8)
+        packed[1, :2] = torch.tensor([0x45, 0x67], dtype=torch.int8)
+        scales = torch.ones(1, 16, dtype=torch.float32)
+        scales[0, :2] = torch.tensor([2.0, 4.0])
         result = dequantize_fp4_weight(packed, scales)
-        assert result.shape == (2, 4)
+        assert result.shape == (2, 32)
         assert result.dtype == torch.bfloat16
 
     def test_fp4_dequantize_values(self):
@@ -29,45 +32,48 @@ class TestFP4Dequantize:
             0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
         )
-        packed = torch.tensor([[0x01], [0x23]], dtype=torch.int8)
-        scales = torch.tensor([[1.0]], dtype=torch.float32)
+        packed = torch.zeros(2, 16, dtype=torch.int8)
+        packed[0, 0] = 0x01
+        packed[1, 0] = 0x23
+        scales = torch.ones(1, 16, dtype=torch.float32)
         result = dequantize_fp4_weight(packed, scales)
 
         row0_low = lut[0x01 & 0xF]
         row0_high = lut[(0x01 >> 4) & 0xF]
         row1_low = lut[0x23 & 0xF]
         row1_high = lut[(0x23 >> 4) & 0xF]
-        expected = torch.tensor([[row0_low, row0_high], [row1_low, row1_high]], dtype=torch.bfloat16)
+        expected = torch.zeros(2, 32, dtype=torch.bfloat16)
+        expected[0, :2] = torch.tensor([row0_low, row0_high])
+        expected[1, :2] = torch.tensor([row1_low, row1_high])
         assert torch.allclose(result, expected)
 
     def test_fp4_dequantize_scales_applied(self):
-        packed = torch.tensor([[0x01, 0x23]], dtype=torch.int8)
-        scales = torch.tensor([[2.0, 3.0]], dtype=torch.float32)
+        packed = torch.zeros(1, 32, dtype=torch.int8)
+        packed[0, 0] = 0x01
+        packed[0, 1] = 0x23
+        scales = torch.ones(1, 32, dtype=torch.float32)
+        scales[0, 0] = 2.0
+        scales[0, 1] = 3.0
         result = dequantize_fp4_weight(packed, scales)
         lut = (
             0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
         )
-        expected = torch.tensor(
-            [
-                [
-                    lut[0x01 & 0xF] * 2.0,
-                    lut[(0x01 >> 4) & 0xF] * 2.0,
-                    lut[0x23 & 0xF] * 3.0,
-                    lut[(0x23 >> 4) & 0xF] * 3.0,
-                ]
-            ],
-            dtype=torch.bfloat16,
-        )
+        expected = torch.zeros(1, 64, dtype=torch.bfloat16)
+        expected[0, 0] = lut[0x01 & 0xF] * 2.0
+        expected[0, 1] = lut[(0x01 >> 4) & 0xF] * 2.0
+        expected[0, 2] = lut[0x23 & 0xF] * 3.0
+        expected[0, 3] = lut[(0x23 >> 4) & 0xF] * 3.0
         assert torch.allclose(result, expected)
 
     def test_fp4_dequantize_3d(self):
-        packed = torch.tensor(
-            [[[0x01, 0x23], [0x45, 0x67]]], dtype=torch.int8
-        )
-        scales = torch.tensor([[[2.0, 4.0]]], dtype=torch.float32)
+        packed = torch.zeros(1, 2, 16, dtype=torch.int8)
+        packed[0, 0, :2] = torch.tensor([0x01, 0x23], dtype=torch.int8)
+        packed[0, 1, :2] = torch.tensor([0x45, 0x67], dtype=torch.int8)
+        scales = torch.ones(1, 1, 16, dtype=torch.float32)
+        scales[0, 0, :2] = torch.tensor([2.0, 4.0])
         result = dequantize_fp4_weight(packed, scales)
-        assert result.shape == (1, 2, 4)
+        assert result.shape == (1, 2, 32)
         assert result.dtype == torch.bfloat16
 
 
@@ -186,29 +192,42 @@ class TestV4BlockDiskLoader:
 
 class TestDequantizeEdgeCases:
     def test_zero_scale(self):
-        packed = torch.tensor([[0x01, 0x23]], dtype=torch.int8)
-        scales = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+        packed = torch.zeros(1, 16, dtype=torch.int8)
+        packed[0, 0] = 0x01
+        packed[0, 1] = 0x23
+        scales = torch.zeros(1, 16, dtype=torch.float32)
         result = dequantize_fp4_weight(packed, scales)
         assert torch.all(result == 0.0)
 
     def test_identity_scale(self):
-        packed = torch.tensor([[0x01]], dtype=torch.int8)
-        scales = torch.tensor([[1.0]], dtype=torch.float32)
+        packed = torch.zeros(1, 16, dtype=torch.int8)
+        packed[0, 0] = 0x01
+        scales = torch.ones(1, 16, dtype=torch.float32)
         result = dequantize_fp4_weight(packed, scales)
         lut = (
             0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
         )
-        expected = torch.tensor([[lut[0x01 & 0xF], lut[(0x01 >> 4) & 0xF]]], dtype=torch.bfloat16)
+        expected = torch.zeros(1, 32, dtype=torch.bfloat16)
+        expected[0, :2] = torch.tensor([lut[0x01 & 0xF], lut[(0x01 >> 4) & 0xF]])
         assert torch.allclose(result, expected)
 
     def test_negative_fp4_values(self):
-        packed = torch.tensor([[0x89]], dtype=torch.uint8).to(torch.int8)
-        scales = torch.tensor([[1.0]], dtype=torch.float32)
+        packed = torch.zeros(1, 16, dtype=torch.uint8)
+        packed[0, 0] = 0x89
+        packed = packed.to(torch.int8)
+        scales = torch.ones(1, 16, dtype=torch.float32)
         result = dequantize_fp4_weight(packed, scales)
         lut = (
             0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
             -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
         )
-        expected = torch.tensor([[lut[0x89 & 0xF], lut[(0x89 >> 4) & 0xF]]], dtype=torch.bfloat16)
+        expected = torch.zeros(1, 32, dtype=torch.bfloat16)
+        expected[0, :2] = torch.tensor([lut[0x89 & 0xF], lut[(0x89 >> 4) & 0xF]])
         assert torch.allclose(result, expected)
+
+    def test_fp4_dequantize_non_divisible_raises(self):
+        packed = torch.tensor([[0x01, 0x23, 0x45]], dtype=torch.int8)
+        scales = torch.tensor([[2.0, 4.0, 6.0]], dtype=torch.float32)
+        with pytest.raises(ValueError, match="must be divisible by block size"):
+            dequantize_fp4_weight(packed, scales)
