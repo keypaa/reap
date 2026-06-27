@@ -5,13 +5,11 @@ import modal
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install_from_parts(
-        packages=[
-            "torch>=2.5.0",
-            "transformers>=4.57.1",
-            "accelerate>=1.3.0",
-            "safetensors>=0.5.0",
-        ],
+    .pip_install(
+        "torch>=2.5.0",
+        "transformers>=4.57.1",
+        "accelerate>=1.3.0",
+        "safetensors>=0.5.0",
     )
     .env({
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
@@ -21,12 +19,11 @@ image = (
 
 app = modal.App("v4-weight-validation")
 
-
 @app.cls(
     image=image,
     gpu="A100-80GB:1",
     timeout=1800,
-    secrets=[modal.Secret.from_name("huggingface-token", required=False)],
+    secrets=[modal.Secret.from_name("huggingface-token")],
 )
 class V4WeightValidator:
     @modal.enter()
