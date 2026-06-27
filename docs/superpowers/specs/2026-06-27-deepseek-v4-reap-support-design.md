@@ -168,28 +168,20 @@ return post.unsqueeze(-1) * mlp_output.unsqueeze(-2) \
 
 ### 3.2 FP8/FP4 Loading and Dequantization
 
-**Challenge:** The published weights are FP4+FP8 mixed (no BF16 version). PyTorch `from_pretrained` loads them at their native precision and only converts to BF16 when used in FP32/BF16 matmuls.
+**Status:** ✅ RESOLVED — `from_pretrained` handles FP4→BF16 decompression automatically.
 
-**Solution for block-from-disk:**
-- Read raw safetensor bytes for each tensor
-- Parse FP8 (E4M3), FP4 (NVFP4), and associated scale factors from the quantization metadata
-- Transfer to GPU, dequantize to BF16
-- Alternative: Use HuggingFace's built-in FP8 loader (`quantization_config`) which handles this automatically when loading partial weights
+When loading with `torch_dtype="bfloat16"`, transformers' custom V4 modeling code
+decompresses the packed I8 (2×FP4 per byte) weights + F8_E8M0 scale factors into full
+BF16 tensors. The router weights (BF16), bias (F32), and hash table (I64) pass through
+unchanged.
 
-Actually, the simplest path: **load the model once normally with `device_map="cpu"` and let HuggingFace handle FP8/FP4 dequantization**. The `quantization_config` in the model config tells transformers how to handle the mixed-precision weights. When loaded on CPU, they stay compressed. When a tensor is moved to GPU, it gets dequantized.
+**For block-from-disk:** Use `from_pretrained` with `device_map="cpu"` and move one
+decoder layer to GPU at a time. The decompression happens transparently during weight
+loading. No custom dequantizer needed.
 
-But this still requires ~160 GB CPU RAM. For the block-from-disk approach, we'd need a custom safetensor loader.
-
-**Compromise approach (recommended):**
-- Use HFCache + `device_map="sequential"` or custom weight loading
-- Load the model onto CPU with FP8/FP4 compressed (~160 GB for Flash) using a machine with 192-256 GB RAM
-- The current layerwise pipeline then moves one block to GPU at a time
-- This avoids writing a custom FP8/FP4 dequantizer
-
-**For Pro (1.6T, ~862 GB):**
-- Still need block-from-disk approach
-- Must parse safetensors and dequantize FP4+FP8 → BF16 per-block
-- One Pro block fits in 96 GB after dequantization, so load+dequantize+process+free per block
+**For Pro (1.6T, ~862 GB):** Same mechanism applies — `from_pretrained` handles
+decompression. The only challenge is loading 862 GB into CPU RAM, which may require
+a block-from-disk approach with partial weight loading from individual safetensor shards.
 
 ### 3.3 Metric Collection Changes
 
@@ -827,7 +819,7 @@ Benchmarks show Flash approaching Pro on reasoning tasks (LiveCodeBench: Flash 9
 
 ### A.9 Open Questions
 
-1. **Weight loading:** Does `AutoModelForCausalLM.from_pretrained` decompress FP4→BF16/FP32? HF `config.json` says `torch_dtype: bfloat16`. Critical first validation step.
+1. **Weight loading:** ✅ RESOLVED — `from_pretrained` decompresses FP4→BF16 automatically. Experts stored as I8 (packed FP4) + F8_E8M0 scales; custom modeling code handles decompression. See `.omo/evidence/2026-06-27-fp4-decompression/`. Standard layerwise pipeline is feasible.
 2. **TileLang:** Is it required for HF forward, or only for custom inference? If needed, add `pip install tilelang`.
 3. **Pro feasibility:** Each layer's experts ≈ 12B params = ~40 GB in FP8. Exceeds A100 80GB even with layerwise approach. Pro likely needs multi-GPU or 96GB+ GPUs.
 4. **Lightning AI pricing:** Needs user input to compare with Modal ($2.50/hr A100, $3.03/hr RTX PRO 6000).
