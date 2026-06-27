@@ -51,6 +51,7 @@ from reap.model_util import (
     MODEL_ATTRS,
     patched_model_map,
     get_super_expert_indices,
+    _is_v4_model,
 )
 from reap.eval import run_evaluate
 from reap.cluster_plots import plot_cluster_analysis
@@ -117,6 +118,11 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 
 def _setup_observer(model, obs_args):
     """Create and return an MoETransformerObserver for the given model."""
+    if _is_v4_model(model):
+        raise RuntimeError(
+            "DeepSeek V4 does not support the standard observation pipeline. "
+            "Use `python -m reap.layerwise_prune` instead."
+        )
     try:
         renormalize_router_weights = (
             getattr(model.config, "norm_topk_prob", False)

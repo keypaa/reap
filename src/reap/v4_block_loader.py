@@ -6,16 +6,25 @@ from pathlib import Path
 import safetensors
 import torch
 import torch.nn as nn
-from transformers import DeepseekV4Config
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4DecoderLayer,
-    DeepseekV4RMSNorm,
-)
+try:
+    from transformers import DeepseekV4Config
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+        DeepseekV4DecoderLayer,
+        DeepseekV4RMSNorm,
+    )
+except (ImportError, KeyError):
+    DeepseekV4Config = None
+    DeepseekV4DecoderLayer = None
+    DeepseekV4RMSNorm = None
 
 _FP4_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
 def dequantize_fp4_weight(quantized: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    if quantized.dim() < 2 or scales.dim() < 2:
+        raise ValueError(
+            f"Quantized tensor dims ({quantized.dim()}) and scales dims ({scales.dim()}) must be >= 2"
+        )
     lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=quantized.device)
     u8 = quantized.contiguous().view(torch.uint8)
     low = (u8 & 0xF).long()
@@ -28,6 +37,17 @@ def dequantize_fp4_weight(quantized: torch.Tensor, scales: torch.Tensor) -> torc
     block_m = rows // scale_rows
     block_n = cols // scale_cols
 
+    block_m_target = 32
+    if cols % block_m_target != 0:
+        raise ValueError(
+            f"Quantized tensor columns ({cols}) must be divisible by block size ({block_m_target})"
+        )
+    if scale_rows * block_m != rows:
+        raise ValueError(
+            f"Shape mismatch: {rows} rows with {scale_rows} scale rows "
+            f"and {block_m} rows per block"
+        )
+
     q = quantized_fp32.reshape(-1, scale_rows, block_m, scale_cols, block_n)
     s = scales.to(torch.float32).reshape(-1, scale_rows, scale_cols).unsqueeze(-1).unsqueeze(2)
     result = (q * s).to(torch.bfloat16)
@@ -39,6 +59,12 @@ class V4BlockDiskLoader:
     def __init__(self, model_path, config=None):
         self.model_path = self._resolve_path(model_path)
         self._shard_cache = {}
+
+        if DeepseekV4Config is None:
+            raise ImportError(
+                "DeepSeek V4 support requires transformers >= 5.9.0. "
+                "Install with: pip install transformers>=5.9.0"
+            )
 
         index_path = self.model_path / "model.safetensors.index.json"
         with open(index_path) as f:
@@ -247,10 +273,78 @@ class V4BlockDiskLoader:
         if down_part is not None:
             state_dict["mlp.experts.down_proj"] = down_part
 
-    def unload_layer(self, layer):
+    def unload_layer(self, layer, clear_shard_cache=False):
         layer.to("cpu")
         del layer
         gc.collect()
+        if clear_shard_cache:
+            self.close()
+
+    def load_into_block(self, block, layer_idx):
+        """Load real BF16 weights from disk into an existing meta block's parameters."""
+        tensor_names = self.layer_map.get(layer_idx, [])
+        state_dict = {}
+
+        per_expert_tensors = {}
+        stacked_expert_tensors = {}
+        shared_tensors = {}
+
+        for name in tensor_names:
+            m = re.match(
+                r"model\.layers\.\d+\.mlp\.experts\.(\d+)\.(w[123])\.(weight|scale)", name
+            )
+            if m:
+                expert_idx = int(m.group(1))
+                w_type = m.group(2)
+                suffix = m.group(3)
+                if expert_idx not in per_expert_tensors:
+                    per_expert_tensors[expert_idx] = {}
+                if w_type not in per_expert_tensors[expert_idx]:
+                    per_expert_tensors[expert_idx][w_type] = {}
+                per_expert_tensors[expert_idx][w_type][suffix] = name
+                continue
+
+            m = re.match(
+                r"model\.layers\.\d+\.mlp\.experts\.(w[123])\.(weight|scale)", name
+            )
+            if m:
+                w_type = m.group(1)
+                suffix = m.group(2)
+                if w_type not in stacked_expert_tensors:
+                    stacked_expert_tensors[w_type] = {}
+                stacked_expert_tensors[w_type][suffix] = name
+                continue
+
+            m = re.match(r"model\.layers\.\d+\.mlp\.shared_experts\.(.+)", name)
+            if m:
+                shared_key = m.group(1)
+                shared_tensors[shared_key] = name
+                continue
+
+            stripped = re.sub(r"^model\.layers\.\d+\.", "", name)
+            tensor = self._load_tensor(name)
+            state_dict[stripped] = self._to_bf16(tensor)
+
+        if per_expert_tensors:
+            self._process_per_expert_tensors(per_expert_tensors, state_dict)
+
+        if stacked_expert_tensors:
+            self._process_stacked_expert_tensors(stacked_expert_tensors, state_dict)
+
+        for shared_key, tensor_name in shared_tensors.items():
+            tensor = self._load_tensor(tensor_name)
+            tensor = self._to_bf16(tensor)
+            state_key = None
+            for w_name, proj_name in self.EXPERT_W_MAP.items():
+                if shared_key.startswith(w_name + "."):
+                    state_key = shared_key.replace(w_name, proj_name, 1)
+                    break
+            if state_key is None:
+                state_key = shared_key
+            state_dict["mlp.shared_experts." + state_key] = tensor
+
+        block.load_state_dict(state_dict, strict=False, assign=True)
+        return block
 
     def close(self):
         self._shard_cache.clear()

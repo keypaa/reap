@@ -1,10 +1,11 @@
 from transformers import DeepseekV4Config
 
-from reap.model_util import MODEL_ATTRS, _is_v4_model
+from reap.model_util import MODEL_ATTRS, _is_v4_model, get_moe_attr_names
 from reap.observer import (
     DeepseekV4MoEObserverHookConfig,
     OBSERVER_CONFIG_REGISTRY,
 )
+from reap.v4_moe_observer import register_v4_standard_hooks
 
 
 class TestModelAttrs:
@@ -30,6 +31,41 @@ class TestModelAttrs:
         assert not _is_v4_model(qwen)
         assert not _is_v4_model(mixtral)
 
+    def test_get_moe_attr_names_v4(self):
+        model = type("DeepseekV4ForCausalLM", (), {"__class__": type("MockCls", (), {"__name__": "DeepseekV4ForCausalLM"})()})()
+        gate, up, down = get_moe_attr_names(model)
+        assert gate == "gate_up_proj"
+        assert up == "gate_up_proj"
+        assert down == "down_proj"
+
+    def test_get_moe_attr_names_non_v4(self):
+        model = type("Qwen3MoeForCausalLM", (), {"__class__": type("MockCls", (), {"__name__": "Qwen3MoeForCausalLM"})()})()
+        gate, up, down = get_moe_attr_names(model)
+        assert gate == "gate_proj"
+        assert up == "up_proj"
+        assert down == "down_proj"
+
+    def test_get_moe_attr_names_unknown(self):
+        model = type("UnknownModel", (), {"__class__": type("MockCls", (), {"__name__": "UnknownModel"})()})()
+        import pytest
+        with pytest.raises(ValueError, match="Unknown model class"):
+            get_moe_attr_names(model)
+
+
+class TestStandardPathGuard:
+    def test_v4_guard_in_setup_observer(self):
+        import ast
+        from pathlib import Path
+        source = Path("src/reap/main.py").read_text()
+        tree = ast.parse(source)
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_setup_observer":
+                body = ast.get_source_segment(source, node)
+                found = "_is_v4_model(model)" in body and "DeepSeek V4 does not support" in body
+                break
+        assert found, "_setup_observer must guard V4 models"
+
 
 class TestObserverConfig:
     def test_v4_observer_config(self):
@@ -42,3 +78,14 @@ class TestObserverConfig:
     def test_registry_contains_v4(self):
         assert "DeepseekV4ForCausalLM" in OBSERVER_CONFIG_REGISTRY
         assert OBSERVER_CONFIG_REGISTRY["DeepseekV4ForCausalLM"] is DeepseekV4MoEObserverHookConfig
+
+
+class TestRegisterV4StandardHooksDoc:
+    def test_docstring_exists(self):
+        doc = register_v4_standard_hooks.__doc__
+        assert doc is not None
+        assert len(doc) > 50
+
+    def test_docstring_mentions_standalone(self):
+        doc = register_v4_standard_hooks.__doc__
+        assert "standalone" in doc.lower() or "custom" in doc.lower() or "not part of the automatic pipeline" in doc

@@ -1,0 +1,680 @@
+diff --git a/src/reap/layerwise_observer.py b/src/reap/layerwise_observer.py
+index 520d1ad..b2b8a36 100644
+--- a/src/reap/layerwise_observer.py
++++ b/src/reap/layerwise_observer.py
+@@ -49,44 +49,47 @@ class _FirstblockInputCaptured(Exception):
+ 
+ 
+ @dataclass
+ class ReplayBatch:
+     """Cached replay payload for one calibration batch."""
+ 
+     inputs: List[torch.Tensor]
+     kwargs: Dict[str, Any]
+     attention_mask: Optional[torch.Tensor] = None
+     position_ids: Optional[torch.Tensor] = None
++    input_ids: Optional[torch.Tensor] = None
+ 
+ 
+ class ReplayCache:
+     """Manage cached replay payloads between layerwise block forwards."""
+ 
+     def __init__(self) -> None:
+         self._batches: List[ReplayBatch] = []
+ 
+     def __len__(self) -> int:
+         return len(self._batches)
+ 
+     def append(
+         self,
+         inputs: List[torch.Tensor],
+         kwargs: Dict[str, Any],
+         attention_mask: Optional[torch.Tensor] = None,
+         position_ids: Optional[torch.Tensor] = None,
++        input_ids: Optional[torch.Tensor] = None,
+     ) -> None:
+         self._batches.append(
+             ReplayBatch(
+                 inputs=inputs,
+                 kwargs=kwargs,
+                 attention_mask=attention_mask,
+                 position_ids=position_ids,
++                input_ids=input_ids,
+             )
+         )
+ 
+     def clear(self) -> None:
+         self._batches.clear()
+ 
+     def materialize(
+         self,
+         batch_idx: int,
+         target_device: torch.device,
+@@ -104,20 +107,24 @@ class ReplayCache:
+         }
+ 
+         if batch.attention_mask is not None:
+             replay_kwargs["attention_mask"] = move_to_device(
+                 batch.attention_mask, target_device
+             )
+         if batch.position_ids is not None:
+             replay_kwargs["position_ids"] = move_to_device(
+                 batch.position_ids, target_device
+             )
++        if batch.input_ids is not None:
++            replay_kwargs["input_ids"] = move_to_device(
++                batch.input_ids, target_device
++            )
+ 
+         return replay_inputs, replay_kwargs
+ 
+     def replace_inputs(self, next_inputs: List[List[torch.Tensor]]) -> None:
+         if len(next_inputs) != len(self._batches):
+             raise ValueError(
+                 "Replacement inputs must match the replay cache batch count"
+             )
+ 
+         for batch, inputs in zip(self._batches, next_inputs):
+@@ -461,32 +468,36 @@ class LayerwiseMoEObserver:
+                     continue
+ 
+                 if param_name is not None:
+                     replay_kwargs[param_name] = move_to_device(value, cpu_device)
+ 
+             for key, value in kwargs.items():
+                 if key in {"hidden_states", "attention_mask", "position_ids"}:
+                     continue
+                 replay_kwargs[key] = move_to_device(value, cpu_device)
+ 
++            input_ids = kwargs.get("input_ids")
+             captured_batches.append(
+                 ReplayBatch(
+                     inputs=replay_inputs,
+                     kwargs=LayerwiseMoEObserver._sanitize_cached_block_kwargs(
+                         replay_kwargs
+                     ),
+                     attention_mask=attention_mask.detach().cpu()
+                     if torch.is_tensor(attention_mask)
+                     else None,
+                     position_ids=position_ids.detach().cpu()
+                     if torch.is_tensor(position_ids)
+                     else None,
++                    input_ids=input_ids.detach().cpu()
++                    if torch.is_tensor(input_ids)
++                    else None,
+                 )
+             )
+ 
+             raise _FirstblockInputCaptured
+ 
+         logger.info("Seeding replay cache from the first decoder block")
+         hook_handle = entry_block.register_forward_pre_hook(
+             intercept_entry_inputs, with_kwargs=True
+         )
+ 
+@@ -498,20 +509,21 @@ class LayerwiseMoEObserver:
+                     continue
+         finally:
+             hook_handle.remove()
+ 
+         for batch in captured_batches:
+             self.replay_cache.append(
+                 inputs=batch.inputs,
+                 kwargs=batch.kwargs,
+                 attention_mask=batch.attention_mask,
+                 position_ids=batch.position_ids,
++                input_ids=batch.input_ids,
+             )
+ 
+         logger.info("Prepared replay cache for %s batches", len(self.replay_cache))
+ 
+         if not self.replay_cache:
+             raise ValueError("Replay cache did not capture any first-block inputs")
+ 
+     @classmethod
+     def _sanitize_cached_block_kwargs(cls, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+         """Drop cache kwargs that cannot be replayed safely."""
+diff --git a/src/reap/metrics.py b/src/reap/metrics.py
+index 400a61d..1534eb0 100644
+--- a/src/reap/metrics.py
++++ b/src/reap/metrics.py
+@@ -277,10 +277,26 @@ class OnlineStatsTracker:
+         y = y.nan_to_num(0)  # Replace NaNs with 0 in case of updated_count being zero
+         y = y - self.mean_compensation
+         # `t` is the new provisional mean.
+         t = self.mean + y
+         # `self.mean_compensation` is the new error (the part that was lost).
+         self.mean_compensation = (t - self.mean) - y
+         # `self.mean` is the new, more accurate mean.
+         self.mean = t
+         # End Kahan Summation
+         self.count = updated_count
++
++    def _partial_update(self, expert_idx: int, new_mean: torch.Tensor, new_count: torch.Tensor):
++        new_count = new_count.to(self.device, torch.long)
++        new_mean = new_mean.to(self.device, dtype=self.dtype)
++
++        updated_count = self.count[expert_idx] + new_count
++        delta = new_mean - self.mean[expert_idx]
++
++        y = delta * new_count / updated_count
++        y = y.nan_to_num(0)
++        y = y - self.mean_compensation[expert_idx]
++        t = self.mean[expert_idx] + y
++        self.mean_compensation[expert_idx] = (t - self.mean[expert_idx]) - y
++        self.mean[expert_idx] = t
++
++        self.count[expert_idx] = updated_count
+diff --git a/src/reap/pruning_metrics.py b/src/reap/pruning_metrics.py
+index 3b1e3c1..e97c3ca 100644
+--- a/src/reap/pruning_metrics.py
++++ b/src/reap/pruning_metrics.py
+@@ -207,10 +207,61 @@ def update_pruning_state(
+     )
+     layer_state["weighted_ean_sum"] += weighted_ean_sum.to(device="cpu")
+     layer_state["reap"].update(
+         reap.to("cpu"), pruning_batch.expert_frequency.to("cpu")
+     )
+     layer_state["weighted_expert_frequency_sum"] += weighted_expert_frequency_sum.to(
+         device="cpu"
+     )
+ 
+     return pruning_batch
++
++
++def update_pruning_state_single_expert(
++    layer_state: dict[str, Any],
++    expert_idx: int,
++    expert_output: torch.Tensor,
++    router_logits: torch.Tensor,
++    selected_experts: torch.Tensor,
++    valid_token_mask: Optional[torch.Tensor] = None,
++    renormalize_router_weights: bool = False,
++) -> None:
++    device = expert_output.device
++
++    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
++    if renormalize_router_weights and selected_experts.numel() > 0:
++        topk_weights = torch.gather(routing_weights, 1, selected_experts)
++        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
++        routing_weights = torch.clamp(
++            routing_weights, min=torch.finfo(routing_weights.dtype).eps
++        )
++
++    active_mask = (selected_experts == expert_idx).any(dim=-1).to(device)
++    if valid_token_mask is not None:
++        valid_token_mask = valid_token_mask.to(device).bool()
++        active_mask = active_mask & valid_token_mask
++
++    if not active_mask.any():
++        return
++
++    active_outputs = expert_output[active_mask]
++    active_router_weights = routing_weights[active_mask, expert_idx]
++    ean_norm = torch.linalg.norm(active_outputs, dim=-1)
++
++    count = active_mask.sum().to(torch.long)
++
++    ean_sum_val = ean_norm.sum().to(dtype=torch.float64)
++    ean_mean_val = ean_norm.mean().to(dtype=torch.float32)
++    weighted_ean_sum_val = (ean_norm * active_router_weights).sum().to(dtype=torch.float64)
++    weighted_expert_freq_sum_val = active_router_weights.sum().to(dtype=torch.float64)
++    reap_val = (ean_norm * active_router_weights).mean().to(dtype=torch.float32)
++
++    layer_state["expert_frequency"][expert_idx] += count.cpu()
++    layer_state["ean_sum"][expert_idx] += ean_sum_val.cpu()
++    layer_state["weighted_ean_sum"][expert_idx] += weighted_ean_sum_val.cpu()
++    layer_state["weighted_expert_frequency_sum"][expert_idx] += weighted_expert_freq_sum_val.cpu()
++    layer_state["ean_mean"]._partial_update(expert_idx, ean_mean_val.cpu(), count.cpu())
++    layer_state["reap"]._partial_update(expert_idx, reap_val.cpu(), count.cpu())
++
++    max_val = active_outputs.max().cpu()
++    if max_val > layer_state["max_activations"][expert_idx]:
++        layer_state["max_activations"][expert_idx] = max_val
+diff --git a/src/reap/v4_moe_observer.py b/src/reap/v4_moe_observer.py
+new file mode 100644
+index 0000000..c5c06ab
+--- /dev/null
++++ b/src/reap/v4_moe_observer.py
+@@ -0,0 +1,227 @@
++"""
++DeepSeek V4-specific MoE observer with incremental expert loop.
++
++V4 stores expert weights as 3D nn.Parameter tensors (e.g., gate_up_proj: [N, 2*D, D]),
++not as ModuleList of per-expert modules. This observer handles:
++1. Indexing into 3D params via expert_idx
++2. Processing one expert at a time (no [E, T, D] activation tensor)
++3. TopKRouter (learned, 40/43 layers) and HashRouter (static hash, first 3 layers)
++"""
++
++from __future__ import annotations
++
++import gc
++import re
++from typing import Any, Optional
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++
++from reap.layerwise_observer import LayerwiseMoEObserver
++from reap.pruning_metrics import update_pruning_state_single_expert
++
++
++class DeepseekV4MoEObserver(LayerwiseMoEObserver):
++    """V4-specific observer with incremental expert loop for 3D parameters.
++
++    Overrides _process_moe_activations to iterate over experts by indexing
++    into the 3D weight tensors directly, avoiding the [E, T, D] activation
++    tensor and the broken enumerate(moe_module.experts) pattern.
++    """
++
++    @torch.inference_mode()
++    def _process_moe_activations(
++        self,
++        block_idx: int,
++        moe_module: nn.Module,
++        input_hidden_states: torch.Tensor,
++        device: torch.device,
++        attention_mask: torch.Tensor | None = None,
++        input_ids: torch.Tensor | None = None,
++    ):
++        num_experts = moe_module.experts.num_experts
++        top_k = moe_module.gate.top_k
++
++        batch_size, sequence_length, hidden_dim = input_hidden_states.shape
++        flat_input = input_hidden_states.view(-1, hidden_dim)
++
++        valid_token_mask = None
++        if attention_mask is not None:
++            attention_mask = attention_mask.to(device)
++            if attention_mask.dim() == 4:
++                mask_row = attention_mask[:, 0, -1, :]
++                if mask_row.dtype == torch.bool:
++                    valid_token_mask = mask_row
++                else:
++                    valid_token_mask = mask_row == 0
++            elif attention_mask.dim() == 2:
++                valid_token_mask = attention_mask.bool()
++            else:
++                import logging
++                logger = logging.getLogger(__name__)
++                logger.warning(
++                    f"Unexpected attention_mask shape {attention_mask.shape}, ignoring"
++                )
++
++            if valid_token_mask is not None:
++                valid_token_mask = valid_token_mask.reshape(-1)
++
++        if block_idx not in self.state:
++            self.state[block_idx] = self._initialize_block_state(num_experts)
++
++        # Detect hash router
++        is_hash = hasattr(moe_module.gate, 'is_hash') and moe_module.gate.is_hash
++
++        # Call router
++        if is_hash:
++            if input_ids is None:
++                raise ValueError(
++                    f"Hash router at block {block_idx} requires input_ids, "
++                    f"but none were provided"
++                )
++            router_result = moe_module.gate(flat_input, input_ids)
++        else:
++            router_result = moe_module.gate(flat_input)
++
++        if isinstance(router_result, tuple):
++            router_logits = router_result[0]
++            selected_experts = router_result[2]
++        else:
++            raise ValueError(
++                f"Unexpected router output type at block {block_idx}: "
++                f"{type(router_result)}"
++            )
++
++        selected_experts = selected_experts.to(device)
++
++        # Compute total valid tokens for this batch
++        if valid_token_mask is not None:
++            total_tokens = valid_token_mask.sum()
++        else:
++            total_tokens = torch.tensor(flat_input.shape[0], device="cpu", dtype=torch.long)
++        self.state[block_idx]["total_tokens"] += total_tokens
++
++        # Incremental expert loop — one expert at a time
++        for expert_idx in range(num_experts):
++            gate_up = F.linear(
++                flat_input, moe_module.experts.gate_up_proj[expert_idx]
++            )
++            gate, up = gate_up.chunk(2, dim=-1)
++
++            if hasattr(moe_module.experts, 'act_fn'):
++                act_fn = moe_module.experts.act_fn
++            else:
++                act_fn = F.silu
++
++            limit = getattr(moe_module.experts, 'limit', 10.0)
++            hidden = act_fn(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
++            expert_output = F.linear(
++                hidden, moe_module.experts.down_proj[expert_idx]
++            )
++
++            update_pruning_state_single_expert(
++                self.state[block_idx],
++                expert_idx,
++                expert_output,
++                router_logits,
++                selected_experts,
++                valid_token_mask=valid_token_mask,
++                renormalize_router_weights=self.hook_config.renormalize_router_weights,
++            )
++
++            del gate_up, gate, up, hidden, expert_output
++
++            if expert_idx % 32 == 0:
++                gc.collect()
++
++        del flat_input, router_logits, selected_experts
++        if valid_token_mask is not None:
++            del valid_token_mask
++        gc.collect()
++
++
++def register_v4_standard_hooks(model, hook_config, state):
++    """Register forward hooks on V4 gate submodules for standard (non-layerwise) observer.
++
++    V4's DeepseekV4SparseMoeBlock doesn't emit router logits in its forward output,
++    so we hook the gate submodule directly to capture them.
++
++    Args:
++        model: The V4 model
++        hook_config: MoETransformerObserverConfig instance
++        state: Dictionary to populate with per-layer metrics
++
++    Returns:
++        List of registered hook handles
++    """
++    from reap.pruning_metrics import initialize_pruning_state
++
++    hooks = []
++
++    for name, module in model.named_modules():
++        module_cls_name = module.__class__.__name__
++        if module_cls_name not in ("DeepseekV4TopKRouter", "DeepseekV4HashRouter"):
++            continue
++
++        layer_number = int(re.search(r"\d+", name).group(0))
++
++        moe_block_name = re.sub(r"\.gate$", "", name)
++        moe_module = model.get_submodule(moe_block_name)
++
++        num_experts = moe_module.experts.num_experts
++        top_k = moe_module.gate.top_k
++
++        if layer_number not in state:
++            state[layer_number] = initialize_pruning_state(num_experts)
++
++        @torch.no_grad()
++        def _make_hook_fn(
++            _moe=moe_module,
++            _layer=layer_number,
++            _num_experts=num_experts,
++            _top_k=top_k,
++            _is_hash=hasattr(module, 'is_hash') and module.is_hash,
++        ):
++            def _hook_fn(_, args, output):
++                input_hidden = args[0]
++                device = input_hidden.device
++                batch_size, seq_len, hidden_dim = input_hidden.shape
++                flat_input = input_hidden.reshape(-1, hidden_dim)
++
++                router_logits = output[0]
++
++                indices = torch.topk(router_logits, _top_k, dim=-1)[1].to(device)
++
++                for expert_idx in range(_num_experts):
++                    gate_up = F.linear(
++                        flat_input, _moe.experts.gate_up_proj[expert_idx]
++                    )
++                    gate, up = gate_up.chunk(2, dim=-1)
++                    act_fn = getattr(_moe.experts, 'act_fn', F.silu)
++                    limit = getattr(_moe.experts, 'limit', 10.0)
++                    hidden = act_fn(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
++                    expert_output = F.linear(
++                        hidden, _moe.experts.down_proj[expert_idx]
++                    )
++
++                    update_pruning_state_single_expert(
++                        state[_layer],
++                        expert_idx,
++                        expert_output,
++                        router_logits,
++                        indices,
++                        renormalize_router_weights=hook_config.renormalize_router_weights,
++                    )
++
++                    del gate_up, gate, up, hidden, expert_output
++
++                del flat_input, router_logits, indices
++
++            return _hook_fn
++
++        hook_fn = _make_hook_fn()
++        hook = module.register_forward_hook(hook_fn)
++        hooks.append(hook)
++
++    return hooks
+diff --git a/tests/test_v4_moe_observer.py b/tests/test_v4_moe_observer.py
+new file mode 100644
+index 0000000..8fafe7b
+--- /dev/null
++++ b/tests/test_v4_moe_observer.py
+@@ -0,0 +1,208 @@
++import torch
++
++from reap.metrics import OnlineStatsTracker
++from reap.pruning_metrics import initialize_pruning_state, update_pruning_state_single_expert
++from reap.v4_moe_observer import DeepseekV4MoEObserver, register_v4_standard_hooks
++from reap.layerwise_observer import LayerwiseMoEObserver, ReplayBatch, ReplayCache
++
++
++class TestOnlineStatsPartialUpdate:
++    def test_partial_update_one_expert(self):
++        tracker = OnlineStatsTracker(shape=(3,), count_shape=(3,), device="cpu", dtype=torch.float32)
++        tracker._partial_update(0, torch.tensor(10.0), torch.tensor(2))
++        assert tracker.count[0].item() == 2
++        assert tracker.mean[0].item() == 10.0
++        assert tracker.count[1].item() == 0
++        assert tracker.count[2].item() == 0
++
++    def test_partial_update_multiple_updates(self):
++        tracker = OnlineStatsTracker(shape=(3,), count_shape=(3,), device="cpu", dtype=torch.float32)
++        tracker._partial_update(0, torch.tensor(10.0), torch.tensor(2))
++        tracker._partial_update(0, torch.tensor(20.0), torch.tensor(2))
++        assert tracker.count[0].item() == 4
++        assert tracker.mean[0].item() == 15.0
++        assert tracker.count[1].item() == 0
++
++    def test_partial_update_multiple_experts(self):
++        tracker = OnlineStatsTracker(shape=(3,), count_shape=(3,), device="cpu", dtype=torch.float32)
++        tracker._partial_update(0, torch.tensor(10.0), torch.tensor(2))
++        tracker._partial_update(1, torch.tensor(30.0), torch.tensor(3))
++        assert tracker.count[0].item() == 2
++        assert tracker.mean[0].item() == 10.0
++        assert tracker.count[1].item() == 3
++        assert tracker.mean[1].item() == 30.0
++        assert tracker.count[2].item() == 0
++
++    def test_partial_update_does_not_affect_other_indices(self):
++        tracker = OnlineStatsTracker(shape=(3,), count_shape=(3,), device="cpu", dtype=torch.float32)
++        tracker.count[0] = 5
++        tracker.mean[0] = 50.0
++        tracker._partial_update(2, torch.tensor(100.0), torch.tensor(1))
++        assert tracker.count[0].item() == 5
++        assert tracker.mean[0].item() == 50.0
++        assert tracker.count[2].item() == 1
++        assert tracker.mean[2].item() == 100.0
++
++    def test_partial_update_zero_count(self):
++        tracker = OnlineStatsTracker(shape=(2,), count_shape=(2,), device="cpu", dtype=torch.float32)
++        tracker._partial_update(0, torch.tensor(5.0), torch.tensor(0))
++        assert tracker.count[0].item() == 0
++        assert tracker.mean[0].item() == 0.0
++
++    def test_partial_update_with_existing_mean(self):
++        tracker = OnlineStatsTracker(shape=(2,), count_shape=(2,), device="cpu", dtype=torch.float32)
++        tracker.count[0] = 5
++        tracker.mean[0] = 10.0
++        tracker._partial_update(0, torch.tensor(20.0), torch.tensor(5))
++        assert tracker.count[0].item() == 10
++        assert tracker.mean[0].item() == 15.0
++
++
++class TestUpdatePruningStateSingleExpert:
++    def test_single_expert_basic(self):
++        state = initialize_pruning_state(2)
++
++        expert_output = torch.tensor([[3.0, 4.0], [1.0, 0.0], [5.0, 12.0]], dtype=torch.float32)
++        selected_experts = torch.tensor([[0], [1], [0]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0, 1.0], [0.0, 3.0], [4.0, 0.0]], dtype=torch.float32)
++
++        update_pruning_state_single_expert(
++            state, 1, expert_output, router_logits, selected_experts
++        )
++
++        assert state["expert_frequency"][1].item() == 1
++        assert state["expert_frequency"][0].item() == 0
++        assert state["ean_sum"][1].item() > 0
++
++    def test_both_experts_independently(self):
++        state = initialize_pruning_state(2)
++
++        expert_output = torch.tensor([[3.0, 4.0], [1.0, 0.0], [5.0, 12.0]], dtype=torch.float32)
++        selected_experts = torch.tensor([[0], [1], [0]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0, 1.0], [0.0, 3.0], [4.0, 0.0]], dtype=torch.float32)
++
++        update_pruning_state_single_expert(
++            state, 0, expert_output, router_logits, selected_experts
++        )
++        update_pruning_state_single_expert(
++            state, 1, expert_output, router_logits, selected_experts
++        )
++
++        assert state["expert_frequency"][0].item() == 2
++        assert state["expert_frequency"][1].item() == 1
++        assert state["ean_sum"][0].item() > 0
++        assert state["ean_sum"][1].item() > 0
++
++    def test_no_active_tokens(self):
++        state = initialize_pruning_state(3)
++
++        expert_output = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
++        selected_experts = torch.tensor([[0]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32)
++
++        update_pruning_state_single_expert(
++            state, 2, expert_output, router_logits, selected_experts
++        )
++
++        assert state["expert_frequency"][2].item() == 0
++        assert state["ean_sum"][2].item() == 0.0
++
++    def test_with_valid_token_mask_filters_padding(self):
++        state = initialize_pruning_state(2)
++
++        expert_output = torch.tensor(
++            [[3.0, 4.0], [1.0, 0.0], [5.0, 12.0]], dtype=torch.float32
++        )
++        selected_experts = torch.tensor([[0], [0], [1]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0, 1.0], [4.0, 0.0], [0.0, 3.0]], dtype=torch.float32)
++        valid_token_mask = torch.tensor([True, False, True])
++
++        update_pruning_state_single_expert(
++            state, 0, expert_output, router_logits, selected_experts,
++            valid_token_mask=valid_token_mask,
++        )
++
++        assert state["expert_frequency"][0].item() == 1
++
++    def test_ean_norm_computation(self):
++        state = initialize_pruning_state(1)
++
++        expert_output = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
++        selected_experts = torch.tensor([[0]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0]], dtype=torch.float32)
++
++        update_pruning_state_single_expert(
++            state, 0, expert_output, router_logits, selected_experts
++        )
++
++        expected_norm = torch.linalg.norm(torch.tensor([3.0, 4.0])).item()
++        assert torch.allclose(state["ean_sum"][0], torch.tensor(expected_norm, dtype=torch.float64))
++        assert torch.allclose(state["ean_mean"].mean[0], torch.tensor(expected_norm, dtype=torch.float32))
++
++    def test_topk_selection(self):
++        state = initialize_pruning_state(3)
++
++        expert_output = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
++        selected_experts = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
++        router_logits = torch.tensor([[2.0, 1.0, 0.5], [0.5, 2.0, 1.0]], dtype=torch.float32)
++
++        update_pruning_state_single_expert(
++            state, 0, expert_output, router_logits, selected_experts
++        )
++
++        assert state["expert_frequency"][0].item() == 1
++        update_pruning_state_single_expert(
++            state, 1, expert_output, router_logits, selected_experts
++        )
++        assert state["expert_frequency"][1].item() == 2
++        update_pruning_state_single_expert(
++            state, 2, expert_output, router_logits, selected_experts
++        )
++        assert state["expert_frequency"][2].item() == 1
++
++
++class TestDeepseekV4MoEObserver:
++    def test_class_imports(self):
++        assert DeepseekV4MoEObserver is not None
++
++    def test_is_subclass_of_layerwise_observer(self):
++        assert issubclass(DeepseekV4MoEObserver, LayerwiseMoEObserver)
++
++    def test_register_v4_standard_hooks_exists(self):
++        assert callable(register_v4_standard_hooks)
++
++
++class TestReplayBatchInputIds:
++    def test_replay_batch_has_input_ids_field(self):
++        batch = ReplayBatch(
++            inputs=[torch.tensor([1, 2, 3])],
++            kwargs={},
++            input_ids=torch.tensor([[1, 2, 3]], dtype=torch.long),
++        )
++        assert batch.input_ids is not None
++        assert torch.equal(batch.input_ids, torch.tensor([[1, 2, 3]], dtype=torch.long))
++
++    def test_replay_cache_append_materialize_input_ids(self):
++        cache = ReplayCache()
++        input_ids = torch.tensor([[4, 5, 6]], dtype=torch.long)
++        cache.append(
++            inputs=[torch.tensor([1.0, 2.0, 3.0])],
++            kwargs={},
++            attention_mask=torch.tensor([[1, 1, 1]], dtype=torch.long),
++            position_ids=torch.tensor([[0, 1, 2]], dtype=torch.long),
++            input_ids=input_ids,
++        )
++        assert len(cache) == 1
++
++        _, materialized_kwargs = cache.materialize(0, torch.device("cpu"))
++        assert "input_ids" in materialized_kwargs
++        assert torch.equal(materialized_kwargs["input_ids"], input_ids)
++
++    def test_replay_cache_input_ids_default_none(self):
++        cache = ReplayCache()
++        cache.append(
++            inputs=[torch.tensor([1.0, 2.0, 3.0])],
++            kwargs={},
++        )
++        _, materialized_kwargs = cache.materialize(0, torch.device("cpu"))
++        assert "input_ids" not in materialized_kwargs

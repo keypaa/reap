@@ -92,7 +92,7 @@ class TestPruneV4Layer:
 
         retained_indices = [0, 2, 4, 6]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert moe_block.experts.gate_up_proj.shape == (4, 2 * intermediate_dim, hidden_dim)
         assert moe_block.experts.down_proj.shape == (4, hidden_dim, intermediate_dim)
@@ -100,12 +100,9 @@ class TestPruneV4Layer:
         assert moe_block.gate.weight.shape == (4, hidden_dim)
         assert moe_block.gate.num_experts == 4
 
-        # Verify retained weights match original
-        for new_idx, old_idx in enumerate(retained_indices):
-            assert torch.equal(
-                moe_block.experts.gate_up_proj[new_idx],
-                moe_block.experts.gate_up_proj[new_idx],
-            )
+        # Verify shapes match retained count
+        assert moe_block.experts.gate_up_proj.shape[0] == len(retained_indices)
+        assert moe_block.experts.down_proj.shape[0] == len(retained_indices)
 
     def test_prune_v4_layer_no_retained(self):
         num_experts = 4
@@ -114,7 +111,7 @@ class TestPruneV4Layer:
 
         retained_indices = [0]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert moe_block.experts.num_experts == 1
         assert moe_block.gate.num_experts == 1
@@ -132,7 +129,7 @@ class TestPruneV4Layer:
 
         retained_indices = [1, 3]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert torch.equal(moe_block.experts.gate_up_proj[0], original_gate_up[1])
         assert torch.equal(moe_block.experts.gate_up_proj[1], original_gate_up[3])
@@ -208,7 +205,7 @@ class TestEScoreCorrectionBias:
 
         retained_indices = [0, 2, 4, 6]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert moe_block.gate.e_score_correction_bias.shape == (4,)
         assert torch.equal(
@@ -229,7 +226,7 @@ class TestEScoreCorrectionBias:
         moe_block.gate = gate
         model = MockDeepseekV4ForCausalLM(num_experts=8)
 
-        _prune_v4_layer(moe_block, [0, 1, 2, 3], model, 0)
+        _prune_v4_layer(moe_block, [0, 1, 2, 3])
         assert moe_block.experts.num_experts == 4
 
     def test_bias_guard_no_crash_without_device(self):
@@ -242,7 +239,7 @@ class TestEScoreCorrectionBias:
         moe_block.gate = gate
         model = MockDeepseekV4ForCausalLM(num_experts=8)
 
-        _prune_v4_layer(moe_block, [0, 1, 2, 3], model, 0)
+        _prune_v4_layer(moe_block, [0, 1, 2, 3])
         assert moe_block.gate.weight.shape == (4, 64)
 
 
@@ -254,7 +251,7 @@ class TestConfigUpdate:
 
         retained_indices = [0, 1, 2, 3, 4]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert model.config.n_routed_experts == 8
         assert model.config.num_local_experts == 8
@@ -268,7 +265,7 @@ class TestSharedExpertsUnchanged:
 
         original_shared = moe_block.shared_experts.state_dict()
 
-        _prune_v4_layer(moe_block, [0, 2, 4, 6], model, 0)
+        _prune_v4_layer(moe_block, [0, 2, 4, 6])
 
         for key, param in moe_block.shared_experts.named_parameters():
             assert torch.equal(param.data, original_shared[key])
@@ -277,7 +274,7 @@ class TestSharedExpertsUnchanged:
         moe_block = MockDeepseekV4SparseMoeBlock(num_experts=8)
         model = MockDeepseekV4ForCausalLM(num_experts=8)
 
-        _prune_v4_layer(moe_block, [0, 2, 4, 6], model, 0)
+        _prune_v4_layer(moe_block, [0, 2, 4, 6])
 
         assert isinstance(moe_block.shared_experts, MockDeepseekV4MLP)
         assert hasattr(moe_block.shared_experts, "gate_proj")
@@ -301,7 +298,7 @@ class TestHashRouterFullRoundtrip:
 
         retained_indices = [0, 2, 4]
 
-        _prune_v4_layer(moe_block, retained_indices, model, 0)
+        _prune_v4_layer(moe_block, retained_indices)
 
         assert moe_block.experts.num_experts == 3
         assert moe_block.experts.gate_up_proj.shape == (3, 2 * intermediate_dim, hidden_dim)

@@ -730,7 +730,7 @@ class LayerwiseMoEObserver:
         self,
         block_idx: int,
         before_forward: Optional[Callable[[], None]] = None,
-        after_forward: Optional[Callable[[torch.device, Optional[torch.Tensor]], None]] = None,
+        after_forward: Optional[Callable[[torch.device, Optional[torch.Tensor], Optional[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
         """Forward cached hidden states through a single transformer block."""
         block_name = (
@@ -787,7 +787,7 @@ class LayerwiseMoEObserver:
                     hidden_states = outputs
 
                 if after_forward is not None:
-                    after_forward(target_device, attention_mask)
+                    after_forward(target_device, attention_mask, block_kwargs)
 
                 block_outputs.append([hidden_states.detach().cpu()])
 
@@ -840,6 +840,7 @@ class LayerwiseMoEObserver:
         def _after_forward(
             target_device: torch.device,
             attention_mask: Optional[torch.Tensor],
+            block_kwargs: Optional[Dict[str, Any]] = None,
         ) -> None:
             moe_input = captured_moe_input.get("input")
             if moe_input is None:

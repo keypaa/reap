@@ -180,9 +180,11 @@ def record_activations_layerwise(
     if _is_v4_model(model):
         from reap.v4_moe_observer import DeepseekV4MoEObserver
 
+        v4_loader = getattr(model, "_v4_block_loader", None)
         observer = DeepseekV4MoEObserver(
             model=model,
             hook_config=hook_config,
+            v4_loader=v4_loader,
         )
     else:
         observer = LayerwiseMoEObserver(
@@ -327,6 +329,8 @@ def main():
                 layerwise_args,
                 results_dir,
             )
+            if _is_v4_model_from_name(model_name):
+                v4_loader.close()
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
@@ -381,13 +385,24 @@ def main():
 
         if _is_v4_model_from_name(model_name):
             from reap.v4_block_loader import V4BlockDiskLoader
+            from reap.v4_prune_utils import prune_v4_model
 
             config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
             with torch.device("meta"):
                 model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-            v4_loader = getattr(model, '_v4_block_loader', None) or V4BlockDiskLoader(model_name, config=config)
+            v4_loader = V4BlockDiskLoader(model_name, config=config)
             v4_loader.load_non_backbone_modules(model)
             model._v4_block_loader = v4_loader
+
+            logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
+            prune_v4_model(
+                observer_data,
+                model,
+                v4_loader,
+                prune_args,
+                n_experts_to_prune,
+                pruned_model_dir,
+            )
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -397,15 +412,14 @@ def main():
                 local_files_only=True,
             )
 
-        # Prune
-        logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
-        prune_model(
-            observer_data,
-            model,
-            prune_args,
-            n_experts_to_prune,
-            pruned_model_dir,
-        )
+            logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
+            prune_model(
+                observer_data,
+                model,
+                prune_args,
+                n_experts_to_prune,
+                pruned_model_dir,
+            )
 
         # Save tokenizer
         tokenizer.save_pretrained(pruned_model_dir)

@@ -112,7 +112,7 @@ def prune(
         if "DeepseekV4" in model.__class__.__name__:
             from reap.v4_prune_utils import _prune_v4_layer
 
-            _prune_v4_layer(moe, retained_expert_indicies, model, layer)
+            _prune_v4_layer(moe, retained_expert_indicies)
 
         elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])

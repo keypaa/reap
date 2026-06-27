@@ -129,6 +129,20 @@ MODEL_ATTRS = {
 }
 
 
+def get_moe_attr_names(model):
+    """Return (gate_proj, up_proj, down_proj) handling V4's fused gate_up_proj."""
+    attrs = MODEL_ATTRS.get(model.__class__.__name__)
+    if not attrs:
+        raise ValueError(f"Unknown model class: {model.__class__.__name__}")
+    gate = attrs["gate_proj"]
+    up = attrs.get("up_proj", gate)
+    down = attrs["down_proj"]
+    if _is_v4_model(model):
+        gate = "gate_up_proj"
+        up = "gate_up_proj"
+    return gate, up, down
+
+
 def _is_v4_model(model) -> bool:
     """Check if model is a DeepSeek V4 variant by class name."""
     return "DeepseekV4" in model.__class__.__name__
@@ -150,10 +164,9 @@ def assert_merge(model, merged_moe, cluster_label):
         "The merged module must have an 'experts' attribute."
     )
 
-    gate_proj = model_attr["gate_proj"]
-    down_proj = model_attr["down_proj"]
+    gate_proj, up_proj, down_proj = get_moe_attr_names(model)
 
-    if model_attr["fused"]:
+    if _is_v4_model(model) or model_attr["fused"]:
         for cluster_id in cluster_label.unique():
             expert_indices = torch.where(cluster_label == cluster_id)[0]
             dom_expert = expert_indices[0]
@@ -167,7 +180,6 @@ def assert_merge(model, merged_moe, cluster_label):
                     getattr(merged_moe.experts, down_proj)[expert],
                 ), f"Experts {expert_indices} are not merged correctly."
     else:
-        up_proj = model_attr["up_proj"]
         for cluster_id in cluster_label.unique():
             expert_indices = torch.where(cluster_label == cluster_id)[0]
             dom_expert = expert_indices[0]
@@ -228,35 +240,51 @@ def assert_tied_weights(model, clusters_labels):
         experts = getattr(moe, model_attrs["experts"])
         for cluster_idx in torch.unique(clusters):
             experts_in_cluster = torch.where(clusters == cluster_idx)[0].tolist()
-            dom_expert = experts[experts_in_cluster[0]]
-            for attr in ["up_proj", "down_proj", "gate_proj"]:
+            if _is_v4_model(model):
+                gate, up, down = get_moe_attr_names(model)
+                dom_expert_idx = experts_in_cluster[0]
                 for expert_idx in experts_in_cluster:
-                    if expert_idx == dom_expert:
+                    if expert_idx == dom_expert_idx:
                         continue
-                    expert = experts[expert_idx]
-                    proj = getattr(expert, attr)
-                    weight = proj.weight
-                    dom_proj = getattr(dom_expert, attr)
-                    dom_weight = dom_proj.weight
-                    if not torch.allclose(weight, dom_weight):
-                        print(
-                            f"Weights for expert {expert_idx} in cluster {cluster_idx} for layer {layer_idx} and attr {attr} are not tied!"
-                        )
-                        print(f"Max diff: {torch.abs(weight - dom_weight).max()}")
-                    # check adapters
-                    for lora_adapter in ["lora_A", "lora_B"]:
-                        if hasattr(proj, lora_adapter):
-                            lora_weight = getattr(proj, lora_adapter).default.weight
-                            dom_lora_weight = getattr(
-                                dom_proj, lora_adapter
-                            ).default.weight
-                            if not torch.allclose(lora_weight, dom_lora_weight):
-                                print(
-                                    f"LoRA Weights for expert {expert_idx} in cluster {cluster_idx} for layer {layer_idx} and adapter {lora_adapter} are not tied!"
-                                )
-                                print(
-                                    f"Max diff: {torch.abs(lora_weight - dom_lora_weight).max()}"
-                                )
+                    for attr in [gate, down]:
+                        dom_weight = getattr(experts, attr)[dom_expert_idx]
+                        weight = getattr(experts, attr)[expert_idx]
+                        if not torch.allclose(weight, dom_weight):
+                            print(
+                                f"Weights for expert {expert_idx} in cluster {cluster_idx} "
+                                f"for layer {layer_idx} and attr {attr} are not tied!"
+                            )
+                            print(f"Max diff: {torch.abs(weight - dom_weight).max()}")
+            else:
+                dom_expert = experts[experts_in_cluster[0]]
+                for attr in ["up_proj", "down_proj", "gate_proj"]:
+                    for expert_idx in experts_in_cluster:
+                        if expert_idx == dom_expert:
+                            continue
+                        expert = experts[expert_idx]
+                        proj = getattr(expert, attr)
+                        weight = proj.weight
+                        dom_proj = getattr(dom_expert, attr)
+                        dom_weight = dom_proj.weight
+                        if not torch.allclose(weight, dom_weight):
+                            print(
+                                f"Weights for expert {expert_idx} in cluster {cluster_idx} for layer {layer_idx} and attr {attr} are not tied!"
+                            )
+                            print(f"Max diff: {torch.abs(weight - dom_weight).max()}")
+                        # check adapters
+                        for lora_adapter in ["lora_A", "lora_B"]:
+                            if hasattr(proj, lora_adapter):
+                                lora_weight = getattr(proj, lora_adapter).default.weight
+                                dom_lora_weight = getattr(
+                                    dom_proj, lora_adapter
+                                ).default.weight
+                                if not torch.allclose(lora_weight, dom_lora_weight):
+                                    print(
+                                        f"LoRA Weights for expert {expert_idx} in cluster {cluster_idx} for layer {layer_idx} and adapter {lora_adapter} are not tied!"
+                                    )
+                                    print(
+                                        f"Max diff: {torch.abs(lora_weight - dom_lora_weight).max()}"
+                                    )
 
 def get_super_expert_indices(observer_data, include_last_layers: bool = False):
     logger.info("Identifying super experts to preserve...")

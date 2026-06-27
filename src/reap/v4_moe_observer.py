@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import gc
 import re
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from reap.layerwise_observer import LayerwiseMoEObserver
+from reap.layerwise_model_utils import cleanup_memory, has_meta_tensors, safe_get_device
 from reap.pruning_metrics import update_pruning_state_single_expert
 
 
@@ -28,7 +29,86 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
     Overrides _process_moe_activations to iterate over experts by indexing
     into the 3D weight tensors directly, avoiding the [E, T, D] activation
     tensor and the broken enumerate(moe_module.experts) pattern.
+
+    Also overrides block loading to load real weights from disk into meta blocks,
+    and activation recording to pass input_ids for hash router support.
     """
+
+    def __init__(self, model, hook_config, block_names=None, v4_loader=None):
+        super().__init__(model, hook_config, block_names)
+        self._v4_loader = v4_loader
+
+    def _load_block_for_replay(self, block_idx):
+        if self.currently_loaded_block_idx == block_idx:
+            return safe_get_device(self.blocks[block_idx])
+
+        self._offload_current_block()
+
+        if self._v4_loader is not None:
+            block = self._block_at(block_idx)
+            if has_meta_tensors(block):
+                self._v4_loader.load_into_block(block, block_idx)
+
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        final_device = self._move_block(self._block_at(block_idx), block_idx, target_device)
+        self.currently_loaded_block_idx = block_idx
+        return final_device
+
+    def _offload_current_block(self):
+        block_idx = self.currently_loaded_block_idx
+        if block_idx < 0:
+            return
+        self.currently_loaded_block_idx = -1
+        cleanup_memory(synchronize=False)
+
+    @torch.inference_mode()
+    def _record_activations_for_block(self, block_idx, moe_module=None):
+        """V4-specific override that passes input_ids for hash routing."""
+        if moe_module is None:
+            moe_module = self._find_moe_module_in_block(block_idx)
+            if moe_module is None:
+                return self._forward_block(block_idx)
+
+        captured_moe_input = {}
+        moe_hook_handle = None
+        _input_ids = None
+
+        def _capture_moe_input_hook(module, args, output):
+            captured_moe_input["input"] = args[0].detach()
+            return output
+
+        def _before_forward():
+            captured_moe_input.clear()
+            nonlocal _input_ids
+            _input_ids = None
+
+        def _after_forward(target_device, attention_mask, block_kwargs=None):
+            nonlocal _input_ids
+            if block_kwargs and "input_ids" in block_kwargs:
+                _input_ids = block_kwargs["input_ids"]
+            moe_input = captured_moe_input.get("input")
+            if moe_input is None:
+                raise RuntimeError(f"Failed to capture MoE input for block {block_idx}")
+
+            self._process_moe_activations(
+                block_idx, moe_module, moe_input,
+                target_device, attention_mask=attention_mask,
+                input_ids=_input_ids,
+            )
+            del moe_input
+            captured_moe_input.clear()
+
+        moe_hook_handle = moe_module.register_forward_hook(_capture_moe_input_hook)
+
+        try:
+            return self._forward_block(
+                block_idx,
+                before_forward=_before_forward,
+                after_forward=_after_forward,
+            )
+        finally:
+            if moe_hook_handle is not None:
+                moe_hook_handle.remove()
 
     @torch.inference_mode()
     def _process_moe_activations(
@@ -142,7 +222,11 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
 
 
 def register_v4_standard_hooks(model, hook_config, state):
-    """Register forward hooks on V4 gate submodules for standard (non-layerwise) observer.
+    """Register forward hooks on V4 gate submodules for standalone/custom usage.
+
+    **Not part of the automatic pipeline.** This function is for standalone or
+    custom observer scripts that bypass `LayerwiseMoEObserver`. The automatic
+    pipeline uses `DeepseekV4MoEObserver` (via `layerwise_prune.py`) instead.
 
     V4's DeepseekV4SparseMoeBlock doesn't emit router logits in its forward output,
     so we hook the gate submodule directly to capture them.
@@ -190,8 +274,7 @@ def register_v4_standard_hooks(model, hook_config, state):
                 flat_input = input_hidden.reshape(-1, hidden_dim)
 
                 router_logits = output[0]
-
-                indices = torch.topk(router_logits, _top_k, dim=-1)[1].to(device)
+                indices = output[2].to(device)
 
                 for expert_idx in range(_num_experts):
                     gate_up = F.linear(
