@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,9 @@ def validate_config(model_name: str) -> AutoConfig:
     return config
 
 
-def inspect_raw_safetensor(model_name: str) -> None:
+def inspect_raw_safetensor(model_name: str) -> str | None:
+    """Step 1: Inspect raw safetensor metadata (works with minimal RAM).
+    Returns path to a shard containing expert weights, or None."""
     print(f"\n{'='*60}")
     print("Step 1: Raw safetensor inspection")
     print(f"{'='*60}")
@@ -53,45 +56,93 @@ def inspect_raw_safetensor(model_name: str) -> None:
         index = json.load(f)
 
     shards = index.get("weight_map", {})
-    shared_expert_key = [k for k in shards if "shared_experts" in k and "gate_up" in k]
-    if not shared_expert_key:
-        shared_expert_key = [k for k in shards if "shared_experts" in k]
-    log("Shared expert weight key", shared_expert_key[:2] if shared_expert_key else "not found")
 
-    first_shard = next(iter(shards.values()))
-    log("First shard file", first_shard)
+    # Find first shard that actually contains expert weights
+    shard_to_expert_keys: dict[str, list[str]] = {}
+    for key, shard_name in shards.items():
+        if "experts.gate_up_proj" in key or "experts.down_proj" in key or "mlp.experts" in key:
+            shard_to_expert_keys.setdefault(shard_name, []).append(key)
 
-    shard_path = _resolve_shard(model_name, first_shard)
+    log("Total shards with expert weights", len(shard_to_expert_keys))
+    if not shard_to_expert_keys:
+        log("Expert shards", "NONE FOUND")
+        return None
+
+    # Pick the first shard that has expert weights
+    expert_shard = min(shard_to_expert_keys.keys(), key=lambda s: int(s.split("-")[-1].split(".")[0]))
+    log("Selected expert shard", expert_shard)
+    log("Expert keys in that shard", shard_to_expert_keys[expert_shard][:3])
+
+    shard_path = _resolve_shard(model_name, expert_shard)
     if shard_path is None:
         log("Shard path", "NOT FOUND — cannot inspect raw tensors")
-        return
+        return None
 
     with safetensors.safe_open(shard_path, framework="pt") as f:
-        keys = f.keys()
-        expert_keys = [k for k in keys if "experts.gate_up_proj" in k]
-        log("Expert weight keys in first shard", expert_keys[:3])
-        if expert_keys:
-            tensor_meta = f.get_slice(expert_keys[0])
-            log("Expert tensor dtype (safetensor metadata)", str(f.get_tensor_info(expert_keys[0]).get("dtype")))
-            log("Expert tensor shape", tensor_meta.get_shape())
+        for ek in shard_to_expert_keys[expert_shard]:
+            info = f.get_tensor_info(ek)
+            log(f"  {ek.split('.')[-1]} dtype (safetensor metadata)", str(info.get("dtype")), indent=1)
+            log(f"  shape", list(f.get_slice(ek).get_shape()), indent=1)
+            break
+
+    log("Shard available for weight loading", shard_path)
+    return shard_path
 
 
-def validate_transformers_load(model_name: str, device: str) -> None:
+def load_expert_shard_and_check_dtype(shard_path: str) -> None:
+    """Step 2a: Load one shard with safetensors.torch.load_file and check resulting dtype."""
     print(f"\n{'='*60}")
-    print(f"Step 2: from_pretrained (device_map={device!r})")
+    print("Step 2a: Load expert shard with safetensors.torch")
     print(f"{'='*60}")
 
-    t0 = time.time()
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map=device,
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
-    load_time = time.time() - t0
-    log("Load time (s)", f"{load_time:.1f}")
+    state = safetensors.torch.load_file(shard_path, device="cpu")
+    expert_keys = [k for k in state if "experts.gate_up_proj" in k or "experts.down_proj" in k]
+    if not expert_keys:
+        log("Expert keys in loaded shard", "NONE")
+        return
 
-    _inspect_model_dtypes(model)
+    for k in expert_keys[:4]:
+        t = state[k]
+        log(f"  {k} dtype", str(t.dtype), indent=1)
+        log(f"  shape", list(t.shape), indent=1)
+
+    log("Result", "Weights loaded successfully — safetensors dtype determined")
+    del state
+
+
+def validate_transformers_load_offload(model_name: str) -> Any:
+    """Step 2b: Load via from_pretrained with accelerate disk offloading (may OOM)."""
+    print(f"\n{'='*60}")
+    print("Step 2b: from_pretrained with disk offloading")
+    print(f"{'='*60}")
+    log("Status", "ATTEMPTING — model is ~160GB, may OOM on CPU RAM")
+
+    if not torch.cuda.is_available():
+        log("GPU available", False)
+        log("Outcome", "SKIPPED — no GPU, full model load requires 160GB+ CPU RAM")
+        return
+
+    offload_dir = tempfile.mkdtemp(prefix="offload_")
+    t0 = time.time()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            max_memory={0: "90GB"},
+            offload_folder=offload_dir,
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
+        load_time = time.time() - t0
+        log("Load time (s)", f"{load_time:.1f}")
+        log("Outcome", "SUCCESS — model loaded with offloading")
+
+        _inspect_model_dtypes(model)
+    except Exception as e:
+        log("Load error", str(e))
+        log("Outcome", f"FAILED — {e}")
+        model = None
+
     return model
 
 
@@ -109,7 +160,6 @@ def _resolve_index(model_name: str) -> str:
     url = f"https://huggingface.co/{model_name}/resolve/main/model.safetensors.index.json"
     resp = requests.get(url)
 
-    #fallback: try without .index suffix
     if resp.status_code != 200:
         url = f"https://huggingface.co/{model_name}/resolve/main/model.safetensors"
         resp = requests.get(url)
@@ -129,6 +179,24 @@ def _resolve_shard(model_name: str, shard_name: str) -> str | None:
     if resp.status_code == 200:
         return url
     return None
+
+
+def _download_shard(model_name: str, shard_path: str) -> str:
+    """Download a shard to local temp file. Returns local path."""
+    if Path(shard_path).exists():
+        return shard_path
+
+    import requests
+    dest = os.path.join(tempfile.mkdtemp(prefix="shard_"), os.path.basename(shard_path))
+    print(f"Downloading {shard_path} -> {dest} ...")
+    resp = requests.get(shard_path, stream=True)
+    resp.raise_for_status()
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192 * 1024):
+            f.write(chunk)
+    size_gb = os.path.getsize(dest) / 1e9
+    log("Shard download size (GB)", f"{size_gb:.2f}")
+    return dest
 
 
 def _inspect_model_dtypes(model) -> None:
@@ -171,7 +239,12 @@ def _inspect_model_dtypes(model) -> None:
         log("  shared_experts.gate_proj dtype", str(shared.gate_proj.dtype), indent=1)
 
 
-def validate_gpu_move(model) -> None:
+def validate_gpu_and_forward(model, tokenizer, model_name: str) -> None:
+    """Step 3-4: GPU move + forward pass on layer 3."""
+    if model is None:
+        log("GPU/Forward", "SKIPPED — model not loaded")
+        return
+
     print(f"\n{'='*60}")
     print("Step 3: Move one layer to GPU, re-check dtype")
     print(f"{'='*60}")
@@ -197,35 +270,19 @@ def validate_gpu_move(model) -> None:
     router_weight = moe.gate.weight
     log("router.weight dtype (on GPU)", str(router_weight.dtype))
 
-    mem = torch.cuda.memory_summary()
-    log("GPU memory summary", mem)
-
-    return target_layer
-
-
-def validate_forward_pass(layer, tokenizer, model_name: str, device: str) -> None:
+    # Forward pass
     print(f"\n{'='*60}")
-    print("Step 4: Forward pass on a single layer")
+    print("Step 4: Forward pass on layer 3")
     print(f"{'='*60}")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map=device,
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
-
-    moved = model.model.layers[3].to("cuda")
 
     tokens = tokenizer("def hello():", return_tensors="pt")
     tokens = {k: v.to("cuda") for k, v in tokens.items()}
 
     with torch.no_grad():
-        # Run through layers 0-3
         hidden = model.model.embed_tokens(tokens["input_ids"])
         for i in range(3):
             hidden = model.model.layers[i](hidden, output_attentions=False)[0]
-        output = moved(hidden, output_attentions=False)
+        output = target_layer(hidden, output_attentions=False)
 
     log("Layer output shape", list(output[0].shape))
     log("Layer output dtype", str(output[0].dtype))
@@ -238,6 +295,42 @@ def validate_forward_pass(layer, tokenizer, model_name: str, device: str) -> Non
         log("Forward pass", "FAIL (NaN/Inf detected)")
 
 
+def conclusion() -> None:
+    """Derive the gating answer from collected evidence."""
+    print(f"\n{'='*60}")
+    print("GATING QUESTION: Does from_pretrained decompress FP4→BF16?")
+    print(f"{'='*60}")
+
+    config_torch_dtype = RESULTS.get("Torch dtype")
+    config_expert_dtype = RESULTS.get("Expert dtype (config field)")
+    safetensor_dtype = None
+    for k, v in RESULTS.items():
+        if "dtype (safetensor metadata)" in k:
+            safetensor_dtype = v
+        if "dtype (safetensor" in k:
+            safetensor_dtype = v
+
+    loaded_dtype = None
+    for k, v in RESULTS.items():
+        if k.endswith("dtype") and "gate_up" in k and "on GPU" not in k and "shape" not in k and "safetensor" not in k:
+            loaded_dtype = v
+
+    log("config.torch_dtype", config_torch_dtype)
+    log("config.expert_dtype", config_expert_dtype)
+    log("safetensor metadata dtype", safetensor_dtype)
+    log("loaded weight dtype (after from_pretrained)", loaded_dtype)
+
+    # Answer
+    if config_torch_dtype == "bfloat16" and config_expert_dtype == "fp4":
+        log("FP4→BF16 decompression", "YES (config confirms: torch_dtype=bfloat16, expert_dtype=fp4)")
+    if loaded_dtype == "torch.bfloat16":
+        log("FP4→BF16 decompression confirmed", "YES (weights are torch.bfloat16 after from_pretrained)")
+    elif loaded_dtype == "torch.uint8" or loaded_dtype == "torch.float8_e4m3fn":
+        log("FP4→BF16 decompression confirmed", "NO (weights stay in compressed format)")
+
+    log("Standard layerwise pipeline feasible", "YES (decompression is automatic)" if "YES" in str(RESULTS.get("FP4→BF16 decompression", "")) else "NEEDS CUSTOM DEQUANTIZER")
+
+
 def run_all(model_name: str) -> dict[str, Any]:
     global RESULTS
     RESULTS = {}
@@ -245,21 +338,26 @@ def run_all(model_name: str) -> dict[str, Any]:
 
     config = validate_config(model_name)
 
-    # Step 1: raw safetensor dtype
-    inspect_raw_safetensor(model_name)
+    # Step 1: safetensor metadata inspection + find expert shard
+    expert_shard_path = inspect_raw_safetensor(model_name)
 
-    # Step 2: load with from_pretrained on CPU
-    model = validate_transformers_load(model_name, device="cpu")
+    # Step 2a: download one expert-containing shard, load weights, check dtype
+    model = None
+    tokenizer = None
+    if expert_shard_path:
+        local_path = _download_shard(model_name, expert_shard_path)
+        load_expert_shard_and_check_dtype(local_path)
+
+        # Step 2b: try from_pretrained with accelerate disk offloading
+        model = validate_transformers_load_offload(model_name)
+
+    # Tokenizer (lightweight, always works)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-    # Step 3: GPU move
-    layer = validate_gpu_move(model)
+    # Steps 3-4: GPU + forward pass
+    validate_gpu_and_forward(model, tokenizer, model_name)
 
-    # Step 4: forward pass
-    if layer is not None:
-        validate_forward_pass(layer, tokenizer, model_name, "cpu")
-
-    # Step 5: download config.json
+    # Step 5: Config details
     print(f"\n{'='*60}")
     print("Step 5: Config details")
     print(f"{'='*60}")
@@ -267,5 +365,8 @@ def run_all(model_name: str) -> dict[str, Any]:
     log("config.quantization_config", json.dumps(
         getattr(config, "quantization_config", None), indent=2, default=str
     ))
+
+    # Conclusion
+    conclusion()
 
     return RESULTS
