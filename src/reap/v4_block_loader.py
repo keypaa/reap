@@ -69,7 +69,7 @@ class V4BlockDiskLoader:
             )
         return self._shard_cache[shard_file].get_tensor(tensor_name)
 
-    def load_non_backbone_modules(self):
+    def load_non_backbone_modules(self, model=None):
         embed_weight = self._load_tensor("model.embed_tokens.weight")
         embed = nn.Embedding.from_pretrained(embed_weight, freeze=True)
         norm_weight = self._load_tensor("model.norm.weight")
@@ -83,6 +83,10 @@ class V4BlockDiskLoader:
             "norm": norm,
             "lm_head": lm,
         }
+        if model is not None:
+            model.model.embed_tokens = embed
+            model.model.norm = norm
+            model.lm_head = lm
         return result
 
     def load_layer(self, layer_idx, device="cuda"):

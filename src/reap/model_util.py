@@ -134,6 +134,11 @@ def _is_v4_model(model) -> bool:
     return "DeepseekV4" in model.__class__.__name__
 
 
+def _is_v4_model_from_name(model_name: str) -> bool:
+    """Check if model name string refers to DeepSeek V4."""
+    return "DeepSeek-V4" in model_name or "deepseek-v4" in model_name
+
+
 def get_moe(model, layer):
     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
     return getattr(model.model.layers[layer], moe_attr_name)

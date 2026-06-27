@@ -29,7 +29,7 @@ from typing import Any, Dict, List
 import yaml
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 
 from accelerate.utils import set_seed
 
@@ -52,6 +52,7 @@ from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
+from reap.model_util import _is_v4_model, _is_v4_model_from_name
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -176,10 +177,18 @@ def record_activations_layerwise(
     )
 
     # Create layerwise observer
-    observer = LayerwiseMoEObserver(
-        model=model,
-        hook_config=hook_config,
-    )
+    if _is_v4_model(model):
+        from reap.v4_moe_observer import DeepseekV4MoEObserver
+
+        observer = DeepseekV4MoEObserver(
+            model=model,
+            hook_config=hook_config,
+        )
+    else:
+        observer = LayerwiseMoEObserver(
+            model=model,
+            hook_config=hook_config,
+        )
 
     # Process all blocks
     save_path = (
@@ -278,14 +287,24 @@ def main():
         data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
 
         # Load model on CPU for layerwise processing
-        logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cpu",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
-        )
+        if _is_v4_model_from_name(model_name):
+            logger.info("Loading DeepSeek V4 model on meta device...")
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            with torch.device("meta"):
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            from reap.v4_block_loader import V4BlockDiskLoader
+
+            v4_loader = V4BlockDiskLoader(model_name, config=config)
+            v4_loader.load_non_backbone_modules(model)
+            model._v4_block_loader = v4_loader
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="cpu",
+                torch_dtype="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
+            )
         model.eval()
 
         logger.info(f"Model loaded: {model.__class__.__name__}")
@@ -360,13 +379,23 @@ def main():
             del model
         cleanup_memory()
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        if _is_v4_model_from_name(model_name):
+            from reap.v4_block_loader import V4BlockDiskLoader
+
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            with torch.device("meta"):
+                model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            v4_loader = getattr(model, '_v4_block_loader', None) or V4BlockDiskLoader(model_name, config=config)
+            v4_loader.load_non_backbone_modules(model)
+            model._v4_block_loader = v4_loader
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype="auto",
+                trust_remote_code=True,
+                local_files_only=True,
+            )
 
         # Prune
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
