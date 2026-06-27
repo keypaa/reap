@@ -117,6 +117,11 @@ MODEL_ATTRS = {
     },
     "DeepseekV4ForCausalLM": {
         "moe_block": "mlp",
+        # V4 uses fused 3D gate_up_proj param — get_moe_attr_names()
+        # overrides gate_proj/up_proj to "gate_up_proj" at call sites.
+        # "fused" is False (placeholder): both True/False crash on V4;
+        # the class-name guard (_is_v4_model) intercepts before any
+        # fused-branch code runs.
         "gate_proj": "gate_proj",
         "up_proj": "up_proj",
         "down_proj": "down_proj",

@@ -227,7 +227,8 @@ class TestDequantizeEdgeCases:
         assert torch.allclose(result, expected)
 
     def test_fp4_dequantize_non_divisible_raises(self):
-        packed = torch.tensor([[0x01, 0x23, 0x45]], dtype=torch.int8)
+        # packed (1,2) → dequant (1,4), scales (1,3): 4 % 3 = 1 → error
+        packed = torch.tensor([[0x01, 0x23]], dtype=torch.int8)
         scales = torch.tensor([[2.0, 4.0, 6.0]], dtype=torch.float32)
-        with pytest.raises(ValueError, match="must be divisible by block size"):
+        with pytest.raises(ValueError, match="must be divisible by"):
             dequantize_fp4_weight(packed, scales)

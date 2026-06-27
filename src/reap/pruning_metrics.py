@@ -245,7 +245,7 @@ def update_pruning_state_single_expert(
 
     active_outputs = expert_output[active_mask]
     active_router_weights = routing_weights[active_mask, expert_idx]
-    ean_norm = torch.linalg.norm(active_outputs, dim=-1)
+    ean_norm = torch.linalg.norm(active_outputs.float(), dim=-1)
 
     count = active_mask.sum().to(torch.long)
 

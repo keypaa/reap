@@ -37,10 +37,10 @@ def dequantize_fp4_weight(quantized: torch.Tensor, scales: torch.Tensor) -> torc
     block_m = rows // scale_rows
     block_n = cols // scale_cols
 
-    block_m_target = 32
-    if cols % block_m_target != 0:
+    if cols % scale_cols != 0:
         raise ValueError(
-            f"Quantized tensor columns ({cols}) must be divisible by block size ({block_m_target})"
+            f"Quantized tensor columns ({cols}) must be divisible by "
+            f"scale block size ({scale_cols})"
         )
     if scale_rows * block_m != rows:
         raise ValueError(

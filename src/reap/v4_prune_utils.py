@@ -112,7 +112,7 @@ def prune_v4_model(observer_data, model, v4_loader, prune_args, n_experts_to_pru
                         observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
     num_layers = model.config.num_hidden_layers
-    last_retained_count = 0
+    num_retained = model.config.n_routed_experts - n_experts_to_prune
 
     for layer_idx in tqdm(range(num_layers), desc="Pruning V4 layers..."):
         if layer_idx not in observer_data:
@@ -136,7 +136,6 @@ def prune_v4_model(observer_data, model, v4_loader, prune_args, n_experts_to_pru
             saliency_data, n_experts_to_prune, largest=False
         )
         retained_indices = [i for i in range(num_experts) if i not in experts_to_prune]
-        last_retained_count = len(retained_indices)
 
         moe_block = model.model.layers[layer_idx].mlp
         _prune_v4_layer(moe_block, retained_indices)
@@ -144,7 +143,6 @@ def prune_v4_model(observer_data, model, v4_loader, prune_args, n_experts_to_pru
         model.model.layers[layer_idx].to("meta")
         gc.collect()
 
-    num_retained = last_retained_count
     model.config.n_routed_experts = num_retained
     model.config.num_local_experts = num_retained
 

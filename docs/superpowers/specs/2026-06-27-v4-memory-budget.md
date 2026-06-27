@@ -210,7 +210,7 @@ New risks identified during memory budget analysis:
 - **Peak CPU RAM (observation):** 38 GB of 180 GB → 142 GB free
 - **Peak CPU RAM (pruning):** 25 GB of 180 GB → 155 GB free
 - **Total pipeline time:** ~45 minutes (39 min observation + 6 min pruning)
-- **Estimated cloud cost (RTX PRO 6000 @ $0.72/hr Modal):** ~$0.54
-- **Estimated cloud cost (RTX PRO 6000 @ $3.03/hr Modal):** ~$2.27
+- **Estimated cloud cost (Lightning AI RTX PRO 6000 @ $1.46/hr spot):** ~$1.10
+- **Estimated cloud cost (Lightning AI RTX PRO 6000 @ $2.80/hr on-demand):** ~$2.10
 
 **Conclusion:** The pipeline fits comfortably on Lightning AI's RTX PRO 6000 (96 GB VRAM, 180 GB RAM) with >80% headroom in both memory domains. Block-from-disk is essential — full model CPU load is infeasible (560 GB > 180 GB). The only constraint is eval phase at low compression ratios, which can use CPU offloading.
