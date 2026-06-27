@@ -37,7 +37,7 @@ def dequantize_fp4_weight(quantized: torch.Tensor, scales: torch.Tensor) -> torc
 class V4BlockDiskLoader:
     EXPERT_W_MAP = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
     def __init__(self, model_path, config=None):
-        self.model_path = Path(model_path)
+        self.model_path = self._resolve_path(model_path)
         self._shard_cache = {}
 
         index_path = self.model_path / "model.safetensors.index.json"
@@ -49,6 +49,28 @@ class V4BlockDiskLoader:
         if config is None:
             config = DeepseekV4Config.from_pretrained(str(self.model_path))
         self.config = config
+
+    @staticmethod
+    def _resolve_path(path):
+        p = Path(path)
+        if p.exists():
+            return p.resolve()
+
+        try:
+            from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+            cache_name = f"models--{str(path).replace('/', '--')}"
+            cache_dir = Path(HUGGINGFACE_HUB_CACHE) / cache_name / "snapshots"
+            if cache_dir.exists():
+                snapshots = sorted(cache_dir.iterdir())
+                if snapshots:
+                    return snapshots[-1]
+        except (ImportError, Exception):
+            pass
+
+        raise FileNotFoundError(
+            f"Model path '{path}' not found locally. "
+            f"Download with: huggingface-cli download {path}"
+        )
 
     def _build_layer_tensor_map(self):
         layer_map = {}

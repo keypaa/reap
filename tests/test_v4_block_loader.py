@@ -9,6 +9,12 @@ import torch
 
 from reap.v4_block_loader import V4BlockDiskLoader, dequantize_fp4_weight
 
+try:
+    from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+    HAS_HF = True
+except ImportError:
+    HAS_HF = False
+
 
 class TestFP4Dequantize:
     def test_fp4_dequantize_shape(self):
@@ -146,6 +152,27 @@ class TestV4BlockDiskLoader:
         loader = V4BlockDiskLoader(mock_model_dir)
         with pytest.raises(safetensors.SafetensorError):
             loader._load_tensor("model.layers.0.mlp.gate.weight")
+
+    def test_resolve_path_local_dir(self, mock_model_dir):
+        resolved = V4BlockDiskLoader._resolve_path(mock_model_dir)
+        assert resolved == mock_model_dir.resolve()
+        assert resolved.is_absolute()
+
+    def test_resolve_path_not_found(self):
+        with pytest.raises(FileNotFoundError, match="not found locally"):
+            V4BlockDiskLoader._resolve_path("nonexistent/model-id")
+
+    def test_resolve_path_hf_cache(self, tmp_path, monkeypatch):
+        if not HAS_HF:
+            pytest.skip("huggingface_hub not installed")
+        cache_root = tmp_path / "hf_cache"
+        snapshot_dir = cache_root / "models--deepseek-ai--DeepSeek-V4-Flash" / "snapshots" / "abc123def"
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.safetensors.index.json").write_text("{}")
+
+        monkeypatch.setattr("huggingface_hub.constants.HUGGINGFACE_HUB_CACHE", str(cache_root))
+        resolved = V4BlockDiskLoader._resolve_path("deepseek-ai/DeepSeek-V4-Flash")
+        assert resolved == snapshot_dir
 
     def test_build_layer_tensor_map_ignores_non_layer_tensors(self, mock_model_dir):
         loader = V4BlockDiskLoader(mock_model_dir)
