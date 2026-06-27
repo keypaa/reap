@@ -284,3 +284,19 @@ class OnlineStatsTracker:
         self.mean = t
         # End Kahan Summation
         self.count = updated_count
+
+    def _partial_update(self, expert_idx: int, new_mean: torch.Tensor, new_count: torch.Tensor):
+        new_count = new_count.to(self.device, torch.long)
+        new_mean = new_mean.to(self.device, dtype=self.dtype)
+
+        updated_count = self.count[expert_idx] + new_count
+        delta = new_mean - self.mean[expert_idx]
+
+        y = delta * new_count / updated_count
+        y = y.nan_to_num(0)
+        y = y - self.mean_compensation[expert_idx]
+        t = self.mean[expert_idx] + y
+        self.mean_compensation[expert_idx] = (t - self.mean[expert_idx]) - y
+        self.mean[expert_idx] = t
+
+        self.count[expert_idx] = updated_count

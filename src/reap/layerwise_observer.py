@@ -56,6 +56,7 @@ class ReplayBatch:
     kwargs: Dict[str, Any]
     attention_mask: Optional[torch.Tensor] = None
     position_ids: Optional[torch.Tensor] = None
+    input_ids: Optional[torch.Tensor] = None
 
 
 class ReplayCache:
@@ -73,6 +74,7 @@ class ReplayCache:
         kwargs: Dict[str, Any],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> None:
         self._batches.append(
             ReplayBatch(
@@ -80,6 +82,7 @@ class ReplayCache:
                 kwargs=kwargs,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
+                input_ids=input_ids,
             )
         )
 
@@ -110,6 +113,10 @@ class ReplayCache:
         if batch.position_ids is not None:
             replay_kwargs["position_ids"] = move_to_device(
                 batch.position_ids, target_device
+            )
+        if batch.input_ids is not None:
+            replay_kwargs["input_ids"] = move_to_device(
+                batch.input_ids, target_device
             )
 
         return replay_inputs, replay_kwargs
@@ -468,6 +475,7 @@ class LayerwiseMoEObserver:
                     continue
                 replay_kwargs[key] = move_to_device(value, cpu_device)
 
+            input_ids = kwargs.get("input_ids")
             captured_batches.append(
                 ReplayBatch(
                     inputs=replay_inputs,
@@ -479,6 +487,9 @@ class LayerwiseMoEObserver:
                     else None,
                     position_ids=position_ids.detach().cpu()
                     if torch.is_tensor(position_ids)
+                    else None,
+                    input_ids=input_ids.detach().cpu()
+                    if torch.is_tensor(input_ids)
                     else None,
                 )
             )
@@ -505,6 +516,7 @@ class LayerwiseMoEObserver:
                 kwargs=batch.kwargs,
                 attention_mask=batch.attention_mask,
                 position_ids=batch.position_ids,
+                input_ids=batch.input_ids,
             )
 
         logger.info("Prepared replay cache for %s batches", len(self.replay_cache))

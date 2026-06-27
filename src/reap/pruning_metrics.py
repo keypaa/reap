@@ -214,3 +214,54 @@ def update_pruning_state(
     )
 
     return pruning_batch
+
+
+def update_pruning_state_single_expert(
+    layer_state: dict[str, Any],
+    expert_idx: int,
+    expert_output: torch.Tensor,
+    router_logits: torch.Tensor,
+    selected_experts: torch.Tensor,
+    valid_token_mask: Optional[torch.Tensor] = None,
+    renormalize_router_weights: bool = False,
+) -> None:
+    device = expert_output.device
+
+    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float).to(device)
+    if renormalize_router_weights and selected_experts.numel() > 0:
+        topk_weights = torch.gather(routing_weights, 1, selected_experts)
+        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+        routing_weights = torch.clamp(
+            routing_weights, min=torch.finfo(routing_weights.dtype).eps
+        )
+
+    active_mask = (selected_experts == expert_idx).any(dim=-1).to(device)
+    if valid_token_mask is not None:
+        valid_token_mask = valid_token_mask.to(device).bool()
+        active_mask = active_mask & valid_token_mask
+
+    if not active_mask.any():
+        return
+
+    active_outputs = expert_output[active_mask]
+    active_router_weights = routing_weights[active_mask, expert_idx]
+    ean_norm = torch.linalg.norm(active_outputs, dim=-1)
+
+    count = active_mask.sum().to(torch.long)
+
+    ean_sum_val = ean_norm.sum().to(dtype=torch.float64)
+    ean_mean_val = ean_norm.mean().to(dtype=torch.float32)
+    weighted_ean_sum_val = (ean_norm * active_router_weights).sum().to(dtype=torch.float64)
+    weighted_expert_freq_sum_val = active_router_weights.sum().to(dtype=torch.float64)
+    reap_val = (ean_norm * active_router_weights).mean().to(dtype=torch.float32)
+
+    layer_state["expert_frequency"][expert_idx] += count.cpu()
+    layer_state["ean_sum"][expert_idx] += ean_sum_val.cpu()
+    layer_state["weighted_ean_sum"][expert_idx] += weighted_ean_sum_val.cpu()
+    layer_state["weighted_expert_frequency_sum"][expert_idx] += weighted_expert_freq_sum_val.cpu()
+    layer_state["ean_mean"]._partial_update(expert_idx, ean_mean_val.cpu(), count.cpu())
+    layer_state["reap"]._partial_update(expert_idx, reap_val.cpu(), count.cpu())
+
+    max_val = active_outputs.max().cpu()
+    if max_val > layer_state["max_activations"][expert_idx]:
+        layer_state["max_activations"][expert_idx] = max_val
