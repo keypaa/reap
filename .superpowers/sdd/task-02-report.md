@@ -81,3 +81,33 @@ tests/test_pruning_metrics.py::test_update_pruning_state_renormalizes_selected_r
 1. **Shared expert weight format**: The safetensor index naming for `shared_experts` may differ from what's implemented — verified only when loading an actual checkpoint
 2. **No integration test with real weights**: The loader is tested with mock safetensor metadata and synthetic FP4 data, but not end-to-end with a real checkpoint
 3. **Memory during non-backbone loading**: `from_pretrained` loads the full model briefly (~560 GB CPU RAM), which might OOM even for just 2 seconds — could optimize to load these 3 modules directly from safetensor shards if needed
+
+---
+
+## Review Fixes Applied (2026-06-27)
+
+### Critical #2: `nn.LayerNorm` → `DeepseekV4RMSNorm`
+- **File**: `src/reap/v4_block_loader.py:10-11` (import), `src/reap/v4_block_loader.py:77` (usage)
+- **Fix**: Imported `DeepseekV4RMSNorm` from `transformers.models.deepseek_v4.modeling_deepseek_v4` and used it instead of `nn.LayerNorm` with `eps=self.config.rms_norm_eps`. DeepseekV4's `model.norm` is RMSNorm (bias-less, doesn't subtract mean), so `nn.LayerNorm` would produce incorrect output.
+
+### Important #3: Overly permissive exception catch
+- **File**: `tests/test_v4_block_loader.py:148`
+- **Fix**: Changed `pytest.raises((FileNotFoundError, RuntimeError, OSError, Exception))` to `pytest.raises(safetensors.SafetensorError)`. `SafetensorError` is what `safetensors.safe_open` raises on empty/corrupt files. Added `import safetensors` to the test file.
+
+### Important #4: Unused variable in `_process_per_expert_tensors`
+- **File**: `src/reap/v4_block_loader.py:167`
+- **Fix**: Removed `n_experts = self.config.n_routed_experts` which was assigned but never used.
+
+### Minor #5: Unused class variable `EXPERT_WEIGHT_TO_PARAM`
+- **File**: `src/reap/v4_block_loader.py:36`
+- **Fix**: Removed `EXPERT_WEIGHT_TO_PARAM` class variable (never referenced anywhere in the codebase).
+
+### Not Changed
+- **Critical #1 (wrong concat dim)**: False positive. `dim=1` (3D) and `dim=-2` (2D) are both correct — they concatenate along the output/row dimension giving shape `[N, 2*intermediate_dim, hidden_dim]` matching `gate_up_proj`.
+
+### Test Results
+```
+tests/test_v4_block_loader.py       11/11 passed
+tests/test_v4_model_registration.py  5/5  passed
+                                   16/16 passed in 10.58s
+```

@@ -7,7 +7,10 @@ import safetensors
 import torch
 import torch.nn as nn
 from transformers import DeepseekV4Config
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4RMSNorm,
+)
 
 _FP4_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
@@ -33,8 +36,6 @@ def dequantize_fp4_weight(quantized: torch.Tensor, scales: torch.Tensor) -> torc
 
 class V4BlockDiskLoader:
     EXPERT_W_MAP = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-    EXPERT_WEIGHT_TO_PARAM = {"w1": "gate_up_proj", "w2": "down_proj", "w3": "gate_up_proj"}
-
     def __init__(self, model_path, config=None):
         self.model_path = Path(model_path)
         self._shard_cache = {}
@@ -72,7 +73,7 @@ class V4BlockDiskLoader:
         embed_weight = self._load_tensor("model.embed_tokens.weight")
         embed = nn.Embedding.from_pretrained(embed_weight, freeze=True)
         norm_weight = self._load_tensor("model.norm.weight")
-        norm = nn.LayerNorm(self.config.hidden_size, elementwise_affine=True)
+        norm = DeepseekV4RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
         norm.weight.data = norm_weight.to(norm.weight.dtype)
         lm_weight = self._load_tensor("lm_head.weight")
         lm = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
@@ -163,7 +164,6 @@ class V4BlockDiskLoader:
         return tensor
 
     def _process_per_expert_tensors(self, per_expert_tensors, state_dict):
-        n_experts = self.config.n_routed_experts
         gate_parts = []
         up_parts = []
         down_parts = []

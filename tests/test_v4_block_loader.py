@@ -3,6 +3,7 @@ import re
 import tempfile
 from pathlib import Path
 
+import safetensors
 import pytest
 import torch
 
@@ -143,7 +144,7 @@ class TestV4BlockDiskLoader:
 
     def test_load_tensor_raises_on_missing_shard(self, mock_model_dir):
         loader = V4BlockDiskLoader(mock_model_dir)
-        with pytest.raises((FileNotFoundError, RuntimeError, OSError, Exception)):
+        with pytest.raises(safetensors.SafetensorError):
             loader._load_tensor("model.layers.0.mlp.gate.weight")
 
     def test_build_layer_tensor_map_ignores_non_layer_tensors(self, mock_model_dir):
