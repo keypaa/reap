@@ -107,7 +107,14 @@ def prune(
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+
+        # --- V4 INTERCEPTION ---
+        if "DeepseekV4" in model.__class__.__name__:
+            from reap.v4_prune_utils import _prune_v4_layer
+
+            _prune_v4_layer(moe, retained_expert_indicies, model, layer)
+
+        elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -147,7 +154,11 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    if "DeepseekV4" in model.__class__.__name__:
+        model.config.n_routed_experts = retained_experts
+        model.config.num_local_experts = retained_experts
+    else:
+        setattr(model.config, model_attrs["num_experts"], retained_experts)
     if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
         model.config.moe_capacity = [
             retained_experts,
