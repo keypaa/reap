@@ -93,7 +93,6 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
                 f"{type(router_result)}"
             )
 
-        _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
         selected_experts = selected_experts.to(device)
 
         # Compute total valid tokens for this batch
