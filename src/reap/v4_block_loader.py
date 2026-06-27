@@ -6,7 +6,7 @@ from pathlib import Path
 import safetensors
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, DeepseekV4Config
+from transformers import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
 
 _FP4_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
@@ -69,18 +69,19 @@ class V4BlockDiskLoader:
         return self._shard_cache[shard_file].get_tensor(tensor_name)
 
     def load_non_backbone_modules(self):
-        full = AutoModelForCausalLM.from_pretrained(
-            str(self.model_path),
-            device_map="cpu",
-            torch_dtype=torch.bfloat16,
-        )
+        embed_weight = self._load_tensor("model.embed_tokens.weight")
+        embed = nn.Embedding.from_pretrained(embed_weight, freeze=True)
+        norm_weight = self._load_tensor("model.norm.weight")
+        norm = nn.LayerNorm(self.config.hidden_size, elementwise_affine=True)
+        norm.weight.data = norm_weight.to(norm.weight.dtype)
+        lm_weight = self._load_tensor("lm_head.weight")
+        lm = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        lm.weight.data = lm_weight.to(lm.weight.dtype)
         result = {
-            "embed_tokens": full.model.embed_tokens,
-            "norm": full.model.norm,
-            "lm_head": full.lm_head,
+            "embed_tokens": embed,
+            "norm": norm,
+            "lm_head": lm,
         }
-        del full
-        gc.collect()
         return result
 
     def load_layer(self, layer_idx, device="cuda"):

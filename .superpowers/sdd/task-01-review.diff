@@ -1,0 +1,128 @@
+diff --git a/src/reap/model_util.py b/src/reap/model_util.py
+index 16bb5d2..a019bfe 100644
+--- a/src/reap/model_util.py
++++ b/src/reap/model_util.py
+@@ -108,23 +108,39 @@ MODEL_ATTRS = {
+         "moe_block": "mlp",
+         "gate_proj": "gate_proj",
+         "up_proj": "up_proj",
+         "down_proj": "down_proj",
+         "experts": "experts",
+         "fused": False,
+         "router": "gate",
+         "num_experts": "n_routed_experts",
+         "num_experts_per_tok": "num_experts_per_tok",
+     },
++    "DeepseekV4ForCausalLM": {
++        "moe_block": "mlp",
++        "gate_proj": "gate_proj",
++        "up_proj": "up_proj",
++        "down_proj": "down_proj",
++        "experts": "experts",
++        "fused": False,
++        "router": "gate",
++        "num_experts": "num_local_experts",
++        "num_experts_per_tok": "num_experts_per_tok",
++    },
+ }
+ 
+ 
++def _is_v4_model(model) -> bool:
++    """Check if model is a DeepSeek V4 variant by class name."""
++    return "DeepseekV4" in model.__class__.__name__
++
++
+ def get_moe(model, layer):
+     moe_attr_name = MODEL_ATTRS.get(model.__class__.__name__)["moe_block"]
+     return getattr(model.model.layers[layer], moe_attr_name)
+ 
+ 
+ def assert_merge(model, merged_moe, cluster_label):
+     model_attr = MODEL_ATTRS.get(model.__class__.__name__)
+     assert hasattr(merged_moe, "experts"), (
+         "The merged module must have an 'experts' attribute."
+     )
+diff --git a/src/reap/observer.py b/src/reap/observer.py
+index 2668200..b1d28d0 100644
+--- a/src/reap/observer.py
++++ b/src/reap/observer.py
+@@ -517,20 +517,29 @@ class Ernie4_5MoEObserverHookConfig(MoETransformerObserverConfig):
+ 
+ 
+ @dataclass
+ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
+     module_class_name_to_hook_regex: Optional[str] = "Glm4MoeMoE"
+     num_experts_attr_name: str = "config.n_routed_experts"
+     top_k_attr_name: str = "config.num_experts_per_tok"
+     fused_experts: bool = False
+ 
+ 
++@dataclass
++class DeepseekV4MoEObserverHookConfig(MoETransformerObserverConfig):
++    module_class_name_to_hook_regex: Optional[str] = "DeepseekV4SparseMoeBlock"
++    num_experts_attr_name: str = "experts.num_experts"
++    top_k_attr_name: str = "gate.top_k"
++    fused_experts: bool = False
++
++
+ OBSERVER_CONFIG_REGISTRY = {
+     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
+     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
+     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
+     "MixtralForCausalLM": MixtralMoEObserverHookConfig,
+     "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,
+     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
+     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
+     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
++    "DeepseekV4ForCausalLM": DeepseekV4MoEObserverHookConfig,
+ }
+diff --git a/tests/test_v4_model_registration.py b/tests/test_v4_model_registration.py
+new file mode 100644
+index 0000000..ecc68a3
+--- /dev/null
++++ b/tests/test_v4_model_registration.py
+@@ -0,0 +1,44 @@
++from transformers import DeepseekV4Config
++
++from reap.model_util import MODEL_ATTRS, _is_v4_model
++from reap.observer import (
++    DeepseekV4MoEObserverHookConfig,
++    OBSERVER_CONFIG_REGISTRY,
++)
++
++
++class TestModelAttrs:
++    def test_model_attrs_v4(self):
++        entry = MODEL_ATTRS["DeepseekV4ForCausalLM"]
++        assert entry["moe_block"] == "mlp"
++        assert entry["gate_proj"] == "gate_proj"
++        assert entry["up_proj"] == "up_proj"
++        assert entry["down_proj"] == "down_proj"
++        assert entry["experts"] == "experts"
++        assert entry["fused"] is False
++        assert entry["router"] == "gate"
++        assert entry["num_experts"] == "num_local_experts"
++        assert entry["num_experts_per_tok"] == "num_experts_per_tok"
++
++    def test_is_v4_model(self):
++        model = type("DeepseekV4ForCausalLM", (), {"__class__": type("MockCls", (), {"__name__": "DeepseekV4ForCausalLM"})()})()
++        assert _is_v4_model(model)
++
++    def test_is_v4_model_other(self):
++        qwen = type("Qwen3MoeForCausalLM", (), {"__class__": type("MockCls", (), {"__name__": "Qwen3MoeForCausalLM"})()})()
++        mixtral = type("MixtralForCausalLM", (), {"__class__": type("MockCls", (), {"__name__": "MixtralForCausalLM"})()})()
++        assert not _is_v4_model(qwen)
++        assert not _is_v4_model(mixtral)
++
++
++class TestObserverConfig:
++    def test_v4_observer_config(self):
++        config = DeepseekV4MoEObserverHookConfig()
++        assert config.module_class_name_to_hook_regex == "DeepseekV4SparseMoeBlock"
++        assert config.num_experts_attr_name == "experts.num_experts"
++        assert config.top_k_attr_name == "gate.top_k"
++        assert config.fused_experts is False
++
++    def test_registry_contains_v4(self):
++        assert "DeepseekV4ForCausalLM" in OBSERVER_CONFIG_REGISTRY
++        assert OBSERVER_CONFIG_REGISTRY["DeepseekV4ForCausalLM"] is DeepseekV4MoEObserverHookConfig
