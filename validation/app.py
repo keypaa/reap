@@ -21,7 +21,7 @@ app = modal.App("v4-weight-validation")
 
 @app.cls(
     image=image,
-    gpu="A100-80GB:1",
+    gpu="RTX-PRO-6000:1",
     timeout=1800,
     secrets=[modal.Secret.from_name("huggingface-token")],
 )
