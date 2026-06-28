@@ -771,6 +771,32 @@ class MixtureOfThoughtsDataset(ChatDatasetProcessor):
         return sample
 
 
+class ReaperCalibrationDataset(ChatDatasetProcessor):
+    """Dataset for keypa/reaper-calibration.
+
+    Has 3 configs: seed-10k, specialist-300k, production-800k.
+    Category field: math, code, agentic.
+    Messages already in chat format (role/content pairs).
+    """
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        return sample
+
+
+class StructuredOutputsCalibrationDataset(LMDatasetProcessor):
+    """Dataset for 0xSero/structured-outputs-calibration-v1.
+
+    Flat text with inline User:/Assistant: labels. No category field.
+    """
+
+    category_field: str = None
+
+    @staticmethod
+    def _map_fn(sample: dict[str, any]) -> dict[str, any]:
+        return sample
+
+
 class XLamFunctionCallingDataset(ChatDatasetProcessor):
     category_field: str = None
 
@@ -972,6 +998,8 @@ DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "euclaise/WritingPrompts_curated": WritingPromptsChatDataset,
     "allenai/tulu-3-sft-personas-math": PersonasMathChatDataset,
     "open-r1/Mixture-of-Thoughts": MixtureOfThoughtsDataset,
+    "keypa/reaper-calibration": ReaperCalibrationDataset,
+    "0xSero/structured-outputs-calibration-v1": StructuredOutputsCalibrationDataset,
     "Salesforce/xlam-function-calling-60k": XLamFunctionCallingDataset,
     "SWE-bench/SWE-smith-trajectories": SWESmithTrajectoriesDataset,
 }
