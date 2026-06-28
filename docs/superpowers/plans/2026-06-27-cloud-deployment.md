@@ -155,7 +155,7 @@ import torch; print(f"CUDA: {torch.cuda.is_available()}, VRAM: {torch.cuda.get_d
 
 ### Task 1.3: Download V4 Flash weights
 
-- [ ] **Download to cache (~160 GB, 20-40 min)**
+- [ ] **Download to cache (~160 GB, 10-20 min)**
 ```bash
 huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
   --local-dir ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/latest
@@ -268,10 +268,12 @@ ls ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/lat
 ### Task 3.2: Run observation
 
 - [ ] **Run layerwise observation**
+
+Mix your dataset (seed-10k for diversity) with Sero's dataset (for domain coverage):
 ```bash
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "theblackcat102/evol-codealpaca-v1" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]:200,keypa/reap-calibration-v1-full:200" \
   --batch-size 4 \
   --batches-per-category 64 \
   --model-max-length 16384 \
@@ -303,11 +305,11 @@ print(f"Layers: {len(data)}, Experts: {data[0]['expert_frequency'].shape[0]}")
 
 ### Task 4.1: Run pruning
 
-- [ ] **Prune (reuses cached observer data)**
+- [ ] **Prune (reuses cached observer data — must use same dataset spec as observation)**
 ```bash
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "theblackcat102/evol-codealpaca-v1" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]:200,keypa/reap-calibration-v1-full:200" \
   --prune-method "reap" \
   --compression-ratio 0.5 \
   --run-observer-only False
@@ -364,6 +366,28 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 | **transformers** | 5.13.0.dev0 (git main) | 5.13.0.dev0 (git main) |
 | **V4 weights** | Not downloaded | ~160 GB downloaded |
 | **Cost** | $0 | ~$1.50-1.85 |
+
+## Available Datasets
+
+Three calibration datasets are registered in the pipeline:
+
+| Dataset | Samples | Category | Fields | Format |
+|---------|---------|----------|--------|--------|
+| `keypa/reaper-calibration[seed-10k]` | 10,000 | `math`, `code`, `agentic` | `messages`, `category` | Chat (role/content pairs) |
+| `keypa/reaper-calibration[specialist-300k]` | 300,000 | `math`, `code`, `agentic` | `messages`, `category` | Chat |
+| `keypa/reaper-calibration[production-800k]` | 800,000 | `math`, `code`, `agentic` | `messages`, `category` | Chat |
+| `keypa/reap-calibration-v1-full` | 23,088 | 10 domains (includes refusals) | `messages`, `category` | Flat text → user message |
+| `keypa/reap-calibration-v1-filtered` | 20,980 | 10 domains (no refusals) | `messages`, `category` | Flat text → user message |
+| `0xSero/structured-outputs-calibration-v1` | 430 | None | `text` | Flat text with role labels |
+
+**Composite spec examples:**
+```bash
+# Mix sizes and domains
+--dataset-name "keypa/reaper-calibration[seed-10k]:200,keypa/reap-calibration-v1-full:200"
+
+# All three datasets combined
+--dataset-name "keypa/reaper-calibration[seed-10k]:100,keypa/reap-calibration-v1-full:100,0xSero/structured-outputs-calibration-v1:50"
+```
 
 ## Known Issues & Workarounds
 
