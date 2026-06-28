@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from reap.metrics import OnlineStatsTracker
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state_single_expert
@@ -206,3 +208,82 @@ class TestReplayBatchInputIds:
         )
         _, materialized_kwargs = cache.materialize(0, torch.device("cpu"))
         assert "input_ids" not in materialized_kwargs
+
+
+class MockV4Config:
+    class Experts:
+        def __init__(self, num=8):
+            self.num_experts = num
+            hidden = 64
+            d = 32
+            self.gate_up_proj = nn.Parameter(torch.randn(num, 2 * d, hidden))
+            self.down_proj = nn.Parameter(torch.randn(num, hidden, d))
+            self.act_fn = F.silu
+            self.limit = 10.0
+
+    class Gate:
+        def __init__(self, num=8):
+            self.top_k = 2
+            self.is_hash = False
+            self.weight = nn.Parameter(torch.randn(num, 64))
+
+    def __init__(self, num=8):
+        self.experts = self.Experts(num)
+        self.gate = self.Gate(num)
+
+
+def test_batched_experts_match_incremental():
+    """Batched expert mode must produce identical metrics to incremental."""
+    num_experts = 8
+    hidden_dim = 64
+    bs, seq = 2, 16
+
+    moe = MockV4Config(num_experts)
+    flat_input = torch.randn(bs * seq, hidden_dim)
+    router_logits = torch.randn(bs * seq, num_experts)
+    selected_experts = torch.randint(0, num_experts, (bs * seq, 2))
+
+    # Capture incremental mode results
+    state_inc = initialize_pruning_state(num_experts)
+    for idx in range(num_experts):
+        gate_up = F.linear(flat_input, moe.experts.gate_up_proj[idx])
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = F.silu(gate) * up
+        expert_output = F.linear(hidden, moe.experts.down_proj[idx])
+        update_pruning_state_single_expert(
+            state_inc, idx, expert_output, router_logits, selected_experts,
+        )
+        del gate_up, gate, up, hidden, expert_output
+
+    # Capture batched mode results
+    state_batch = initialize_pruning_state(num_experts)
+    batch_size = 4
+    gate_up_weight = moe.experts.gate_up_proj
+    down_weight = moe.experts.down_proj
+    for start in range(0, num_experts, batch_size):
+        end = min(start + batch_size, num_experts)
+        bg = torch.matmul(flat_input, gate_up_weight[start:end].transpose(-2, -1))
+        bg_gate, bg_up = bg.chunk(2, dim=-1)
+        del bg
+        bh = F.silu(bg_gate) * bg_up
+        del bg_gate, bg_up
+        bo = torch.matmul(bh, down_weight[start:end].transpose(-2, -1))
+        del bh
+        for i in range(end - start):
+            update_pruning_state_single_expert(
+                state_batch, start + i, bo[i], router_logits, selected_experts,
+            )
+        del bo
+
+    # Compare all metrics
+    for key in state_inc:
+        if isinstance(state_inc[key], torch.Tensor):
+            assert torch.allclose(state_inc[key], state_batch[key], atol=1e-5), \
+                f"Mismatch in {key}: inc={state_inc[key]}, batch={state_batch[key]}"
+        elif hasattr(state_inc[key], 'mean') and hasattr(state_inc[key], 'count'):
+            assert torch.allclose(state_inc[key].mean, state_batch[key].mean, atol=1e-5), \
+                f"Mismatch OnlineStatsTracker.mean in {key}"
+        elif key == "total_tokens":
+            assert state_inc[key] == state_batch[key]
+
+    print("Batched and incremental modes produce identical metrics.")

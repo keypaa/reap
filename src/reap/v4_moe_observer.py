@@ -34,9 +34,10 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
     and activation recording to pass input_ids for hash router support.
     """
 
-    def __init__(self, model, hook_config, block_names=None, v4_loader=None):
+    def __init__(self, model, hook_config, block_names=None, v4_loader=None, expert_batch_size=0):
         super().__init__(model, hook_config, block_names)
         self._v4_loader = v4_loader
+        self._expert_batch_size = expert_batch_size
 
     def _load_block_for_replay(self, block_idx):
         if self.currently_loaded_block_idx == block_idx:
@@ -182,43 +183,109 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
             total_tokens = torch.tensor(flat_input.shape[0], device="cpu", dtype=torch.long)
         self.state[block_idx]["total_tokens"] += total_tokens
 
-        # Incremental expert loop — one expert at a time
-        for expert_idx in range(num_experts):
-            gate_up = F.linear(
-                flat_input, moe_module.experts.gate_up_proj[expert_idx]
+        # Choose processing mode
+        if self._expert_batch_size >= 1 and num_experts > self._expert_batch_size:
+            self._process_moe_activations_batched(
+                block_idx, moe_module, flat_input, device,
+                router_logits, selected_experts, valid_token_mask,
+                num_experts,
             )
-            gate, up = gate_up.chunk(2, dim=-1)
+        else:
+            # Incremental expert loop — one expert at a time (original behavior)
+            for expert_idx in range(num_experts):
+                gate_up = F.linear(
+                    flat_input, moe_module.experts.gate_up_proj[expert_idx]
+                )
+                gate, up = gate_up.chunk(2, dim=-1)
 
-            if hasattr(moe_module.experts, 'act_fn'):
-                act_fn = moe_module.experts.act_fn
-            else:
-                act_fn = F.silu
+                if hasattr(moe_module.experts, 'act_fn'):
+                    act_fn = moe_module.experts.act_fn
+                else:
+                    act_fn = F.silu
 
-            limit = getattr(moe_module.experts, 'limit', 10.0)
-            hidden = act_fn(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
-            expert_output = F.linear(
-                hidden, moe_module.experts.down_proj[expert_idx]
-            )
+                limit = getattr(moe_module.experts, 'limit', 10.0)
+                hidden = act_fn(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+                expert_output = F.linear(
+                    hidden, moe_module.experts.down_proj[expert_idx]
+                )
 
-            update_pruning_state_single_expert(
-                self.state[block_idx],
-                expert_idx,
-                expert_output,
-                router_logits,
-                selected_experts,
-                valid_token_mask=valid_token_mask,
-                renormalize_router_weights=self.hook_config.renormalize_router_weights,
-            )
+                update_pruning_state_single_expert(
+                    self.state[block_idx],
+                    expert_idx,
+                    expert_output,
+                    router_logits,
+                    selected_experts,
+                    valid_token_mask=valid_token_mask,
+                    renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                )
 
-            del gate_up, gate, up, hidden, expert_output
+                del gate_up, gate, up, hidden, expert_output
 
-            if expert_idx % 32 == 0:
-                gc.collect()
+                if expert_idx % 32 == 0:
+                    gc.collect()
 
         del flat_input, router_logits, selected_experts
         if valid_token_mask is not None:
             del valid_token_mask
         gc.collect()
+
+    @torch.inference_mode()
+    def _process_moe_activations_batched(
+        self,
+        block_idx: int,
+        moe_module: nn.Module,
+        flat_input: torch.Tensor,
+        device: torch.device,
+        router_logits: torch.Tensor,
+        selected_experts: torch.Tensor,
+        valid_token_mask: torch.Tensor | None,
+        num_experts: int,
+    ):
+        """Process experts in groups to reduce kernel launch overhead.
+
+        Instead of 256 individual F.linear calls (one per expert), groups experts
+        into chunks of expert_batch_size. Each group does one F.linear on
+        [batch_size_e, B*S, D] tensors, then slices per-expert outputs for metrics.
+        """
+        gate_up_weight = moe_module.experts.gate_up_proj  # [E, 2*D, hidden]
+        down_weight = moe_module.experts.down_proj          # [E, hidden, D]
+        act_fn = getattr(moe_module.experts, 'act_fn', F.silu)
+        limit = getattr(moe_module.experts, 'limit', 10.0)
+        batch_size = self._expert_batch_size
+
+        for start in range(0, num_experts, batch_size):
+            end = min(start + batch_size, num_experts)
+            current_batch_size = end - start
+
+            # [current_batch_size, B*S, 2*D]
+            batch_gate_up = torch.matmul(flat_input, gate_up_weight[start:end].transpose(-2, -1))
+            # Split into gate (first half) and up (second half): 2 * [current_batch_size, B*S, D]
+            batch_gate, batch_up = batch_gate_up.chunk(2, dim=-1)
+            del batch_gate_up
+
+            # [current_batch_size, B*S, D]
+            batch_hidden = act_fn(batch_gate.clamp(max=limit)) * batch_up.clamp(min=-limit, max=limit)
+            del batch_gate, batch_up
+
+            # [current_batch_size, B*S, hidden]
+            batch_output = torch.matmul(batch_hidden, down_weight[start:end].transpose(-2, -1))
+            del batch_hidden
+
+            # Slice per-expert outputs and update metrics
+            for i in range(current_batch_size):
+                expert_idx = start + i
+                update_pruning_state_single_expert(
+                    self.state[block_idx],
+                    expert_idx,
+                    batch_output[i],
+                    router_logits,
+                    selected_experts,
+                    valid_token_mask=valid_token_mask,
+                    renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                )
+
+            del batch_output
+            gc.collect()
 
 
 def register_v4_standard_hooks(model, hook_config, state):
