@@ -26,7 +26,7 @@
 
 ### Task 0.0: Set up environment
 
-- [ ] **Clone repo and init submodules**
+- [x] **Clone repo and init submodules**
 
 ```bash
 git clone https://github.com/keypaa/reap reap
@@ -79,7 +79,7 @@ python -m reap.layerwise_prune \
   --n-experts-to-prune 2 \
   --do-eval False \
   --run-observer-only True
-```
+``` 
 
 This runs the observer only (no prune, no eval). On CPU with a 16B model, expect ~5-10 minutes depending on hardware.
 
