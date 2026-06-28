@@ -235,7 +235,7 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
         block_idx: int,
         moe_module: nn.Module,
         flat_input: torch.Tensor,
-        device: torch.device,
+        _device: torch.device,
         router_logits: torch.Tensor,
         selected_experts: torch.Tensor,
         valid_token_mask: torch.Tensor | None,
