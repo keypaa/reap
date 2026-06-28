@@ -184,7 +184,7 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
         self.state[block_idx]["total_tokens"] += total_tokens
 
         # Choose processing mode
-        if self._expert_batch_size >= 1 and num_experts > self._expert_batch_size:
+        if self._expert_batch_size >= 1:
             self._process_moe_activations_batched(
                 block_idx, moe_module, flat_input, device,
                 router_logits, selected_experts, valid_token_mask,
