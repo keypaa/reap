@@ -19,7 +19,7 @@ if [ "$V4_MODE" = true ]; then
     uv pip install --editable . --no-deps -vv
     uv pip install torch --index-url https://download.pytorch.org/whl/cpu
     uv pip install git+https://github.com/huggingface/transformers.git "huggingface_hub>=0.34.0"
-    uv pip install accelerate datasets matplotlib seaborn tqdm numpy scipy
+    uv pip install accelerate datasets matplotlib seaborn tqdm numpy scipy python-dotenv pytest
 else
     # Full install with CUDA deps (deepspeed, vllm, etc.)
     VLLM_USE_PRECOMPILED=1 uv pip install --editable . -vv --torch-backend auto
