@@ -267,13 +267,33 @@ ls ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/lat
 
 ### Task 3.2: Run observation
 
-- [ ] **Run layerwise observation**
+- [ ] **Run layerwise observation (3 separate runs — one per dataset)**
 
-Mix your dataset (seed-10k for diversity) with Sero's dataset (for domain coverage):
 ```bash
+# Run 1: your dataset (10k subset)
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reaper-calibration[seed-10k]:200,keypa/reap-calibration-v1-full:200" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]:200" \
+  --batch-size 4 \
+  --batches-per-category 64 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --run-observer-only True
+
+# Run 2: Sero's full (includes refusals)
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-full:200" \
+  --batch-size 4 \
+  --batches-per-category 64 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --run-observer-only True
+
+# Run 3: Sero's filtered (no refusals)
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-filtered:200" \
   --batch-size 4 \
   --batches-per-category 64 \
   --model-max-length 16384 \
@@ -282,6 +302,8 @@ python -m reap.layerwise_prune \
 ```
 
 **Parameters:** batch-size 4 (14 GB VRAM/layer), batches-per-category 64 (~12K tokens), model-max-length 16384 (V4 native context), run-observer-only True.
+
+**Cost:** 3 × 39 min = ~117 min GPU time ≈ $2.85 at spot pricing.
 
 **Expected runtime:** ~39 min (43 layers × ~50-55 sec).
 
@@ -305,11 +327,29 @@ print(f"Layers: {len(data)}, Experts: {data[0]['expert_frequency'].shape[0]}")
 
 ### Task 4.1: Run pruning
 
-- [ ] **Prune (reuses cached observer data — must use same dataset spec as observation)**
+- [ ] **Prune each dataset (reuses cached observer data from matching observation run)**
+
 ```bash
+# After Run 1
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reaper-calibration[seed-10k]:200,keypa/reap-calibration-v1-full:200" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]:200" \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 2
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-full:200" \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 3
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-filtered:200" \
   --prune-method "reap" \
   --compression-ratio 0.5 \
   --run-observer-only False
@@ -348,10 +388,10 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 | 0: CPU Setup & Test | ~30 min | — | $0 |
 | 1: GPU Setup + 160 GB download | ~60 min | — | $0* |
 | 2: 1-Layer Test | ~1 min | ~$0.02 | $0.02 |
-| 3: Full Observation | ~39 min | ~$0.95 | $0.95 |
-| 4a: Prune | ~6 min | ~$0.15 | $0.15 |
-| 4b: Eval | ~15-30 min | ~$0.36-0.73 | $0.36-0.73 |
-| **Total** | **~2.5 hrs** | **~1 hr GPU** | **~$1.50-1.85** |
+| 3: Full Observation (×3 datasets) | ~117 min | ~$2.85 | $2.85 |
+| 4a: Prune (×3 datasets) | ~18 min | ~$0.45 | $0.45 |
+| 4b: Eval (×3 models) | ~45-90 min | ~$1.08-2.19 | $1.08-2.19 |
+| **Total** | **~4.5 hrs** | **~3 hrs GPU** | **~$4.40-5.51** |
 
 \* Storage transfer between cloud regions may add ~$4-5.
 
