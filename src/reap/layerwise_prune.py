@@ -185,6 +185,7 @@ def record_activations_layerwise(
             model=model,
             hook_config=hook_config,
             v4_loader=v4_loader,
+            expert_batch_size=obs_args.expert_batch_size if obs_args.batched_experts else 0,
         )
     else:
         observer = LayerwiseMoEObserver(
