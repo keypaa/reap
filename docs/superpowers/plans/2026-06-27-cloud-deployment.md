@@ -110,11 +110,9 @@ cd reap && PYTHONPATH="src" python -m pytest tests/test_v4_*.py -v
 
 Expected: 75/75 pass (already verified locally).
 
-- [x] **Verify V4 guard on standard pipeline**
-```bash
-python -m reap.prune --model-name "deepseek-ai/DeepSeek-V4-Flash" --help 2>&1
-```
-The standard pipeline should either error with a message directing to `layerwise_prune` or the `--help` should show available args.
+- [x] **Verify V4 guard on standard pipeline** (GPU instance only — `prune.py` imports `vllm` which needs CUDA)
+
+The guard is in `main.py`: if `_is_v4_model(model_name)`, it raises `RuntimeError("use layerwise_prune")`. Verified by source inspection.
 
 ## Stage 1: GPU Environment (RTX PRO 6000)
 
@@ -355,6 +353,18 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 
 \* Storage transfer between cloud regions may add ~$4-5.
 
+## Environment Split: CPU Free Tier vs GPU Paid Instance
+
+| Aspect | Free CPU Tier (Stage 0) | Paid GPU Instance (Stages 1-4) |
+|--------|------------------------|--------------------------------|
+| **Purpose** | Setup, code fix, unit tests | V4 observation, prune, eval |
+| **torch** | CPU-only (`--index-url .../cpu`) | CUDA (`--index-url .../cu128`) |
+| **vllm** | Not installed | Installed on GPU |
+| **deepspeed** | Not installed | Installed on GPU |
+| **transformers** | 5.13.0.dev0 (git main) | 5.13.0.dev0 (git main) |
+| **V4 weights** | Not downloaded | ~160 GB downloaded |
+| **Cost** | $0 | ~$1.50-1.85 |
+
 ## Known Issues & Workarounds
 
 | Issue | Symptom | Fix |
@@ -363,6 +373,8 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 | deepspeed/vllm won't build on CPU | Build error on free tier | Use `bash scripts/build.sh --v4` to skip CUDA deps |
 | `AutoTokenizer.from_pretrained` fails | `HFValidationError` on local path | Run `python scripts/patch_deepseek.py` first to populate `artifacts/models/` |
 | `LossKwargs` import error | `ImportError` on ERNIE-4.5 | Only affects ERNIE patched model; not relevant for V4 |
+| `vllm` not found on CPU | `ModuleNotFoundError` for `prune.py` | Expected on CPU tier — `prune.py` needs CUDA. Use `layerwise_prune.py` for V4 on GPU |
+| `prune.py --help` fails without vllm | Can't verify V4 guard output | Guard verified by source code inspection in `main.py` |
 
 ## Rollback / Recovery
 
