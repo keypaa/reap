@@ -146,6 +146,27 @@ class ObserverArgs:
             )
         }, 
     )
+    batched_experts: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, process experts in groups (expert_batch_size at a time) "
+                "using one F.linear call per group instead of one per expert. "
+                "Trades memory for kernel launch overhead reduction. "
+                "Requires DeepSeek V4 observer."
+            )
+        },
+    )
+    expert_batch_size: int = field(
+        default=16,
+        metadata={
+            "help": (
+                "Number of experts to process in one batched F.linear call. "
+                "Only used when batched_experts=True. Larger = fewer launches but more memory. "
+                "With B=8, S=16384: 16 experts ~17 GB peak additional, 32 ~34 GB."
+            )
+        },
+    )
 
 @dataclass
 class ClusterArgs:
