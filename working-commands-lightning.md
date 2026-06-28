@@ -1,295 +1,478 @@
-# Working Commands — REAP Layerwise on Lightning (DeepSeek-V4-Flash)
+# Cloud Launch Guide: DeepSeek V4 Flash REAP Pipeline
 
-**Date:** 2026-06-26  
-**Hardware:** L4 24 GB VRAM, 32 GB RAM, ~306 GB disk  
-**Model:** deepseek-ai/DeepSeek-V4-Flash (284B/13B activated, ~145 GB on disk)
+**Last updated:** 2026-06-28
+**Target hardware:** RTX PRO 6000 (96 GB VRAM, $1.46/hr spot)
+**Model:** deepseek-ai/DeepSeek-V4-Flash (284B, 256 experts, 43 layers, ~160 GB on disk)
+**Pipeline:** layerwise observation → prune 50% → eval
 
 ---
 
-## 1. Environment Setup
+## Overview
+
+Five stages, each gates the next. Stop and assess at each stage boundary.
+
+| Stage | What | Est. Cost | Stop if |
+|-------|------|-----------|---------|
+| 0: CPU Setup | Clone, build, verify, V2-Lite smoke test | $0 | Tests fail |
+| 1: GPU Env | Launch instance, GPU torch, download ~160 GB | $0 (storage maybe $4-5) | CUDA not available, download fails |
+| 2: 1-Layer Smoke | Load 1 V4 layer, observe, prune — measure timing | ~$0.05 | Forward pass fails, VRAM > 90 GB |
+| 3: Full Obs | 4 runs × 43 layers | TBD (Stage 2 tells us) | VRAM leak, wrong output path |
+| 4: Prune + Eval | Prune 4 models, run eval | TBD | Observer data doesn't match |
+
+---
+
+## Prerequisites
+
+- Lightning AI account with billing set up
+- `lightning` CLI installed
+- HF token with read access (`huggingface-cli login` before starting)
+- Your fork of `keypaa/reap` on GitHub (not upstream CerebrasResearch/reap)
+- SSH key added to Lightning AI
+
+---
+
+## Stage 0: CPU Setup (Free Tier, ~30 min)
+
+**Cost: $0** — All on Lightning AI free CPU tier or your local machine.
+
+### 0.1 — Clone and build
 
 ```bash
-# Create venv
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# Init submodules (needed for third-party eval deps)
-ls third-party/*/
+git clone https://github.com/keypaa/reap.git
+cd reap
 git submodule update --init --recursive
-
-# Install package + deps
-uv pip install --python .venv/bin/python -e ".[dev]"
-
-# Verify
-python -c "import torch; print('torch', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA devices:', torch.cuda.device_count()); from transformers import AutoConfig; print('transformers OK')"
-# Expected: torch 2.7.1+cu126, CUDA available: True, CUDA devices: 1, transformers OK
-```
-
-## 2. Upgrade Transformers (required for deepseek_v4)
-
-```bash
-pip install git+https://github.com/huggingface/transformers.git "huggingface_hub>=0.34.0"
-```
-
-## 3. Download Model Weights
-
-```bash
+bash scripts/build.sh --v4
+source .venv/bin/activate
+python -c "from reap.layerwise_prune import main; print('OK')"
 python -c "
-from huggingface_hub import snapshot_download
-print('Downloading DeepSeek-V4-Flash weights (~145 GB)...')
-snapshot_download('deepseek-ai/DeepSeek-V4-Flash')
-print('Download complete')
+from reap.v4_block_loader import V4BlockDiskLoader
+from reap.v4_moe_observer import DeepseekV4MoEObserver
+from reap.v4_prune_utils import prune_v4_model
+print('All V4 components OK')
 "
 ```
-Takes ~7-10 min at ~250 MB/s.
 
-## 4. Patch Source Files (meta-tensor loading + safetensors key matching)
+**What to check:**
+- `build.sh --v4` completes without errors (skips CUDA deps deepspeed/vllm)
+- All 3 V4 imports work
+- If `build.sh` fails: try `pip install git+https://github.com/huggingface/transformers.git` then manually `pip install -e ".[dev]" --no-deps`
 
-DeepSeek-V4-Flash has two quirks that require patches:
-
-### Quirk A: safetensors keys drop the `model.` prefix
-PyTorch modules are `model.layers.0.*` but safetensors keys are `layers.0.*`. Same for non-backbone modules: `model.embed_tokens` → `embed`, `model.norm` → `norm`, `lm_head` → `head`.
-
-### Quirk B: Some block params are not in safetensors (quantized weights)
-`load_state_dict(strict=False, assign=True)` leaves unmatched params on meta device, and `block.to(device)` crashes. Need `to_empty()` first.
-
-### Required patches
-
-Copy these 4 files from local Windows to Lightning instance:
+### 0.2 — Unit tests
 
 ```bash
-scp src/reap/layerwise_model_utils.py s_XXX@ssh.lightning.ai:/teamspace/studios/this_studio/reap/src/reap/
-scp src/reap/layerwise_observer.py s_XXX@ssh.lightning.ai:/teamspace/studios/this_studio/reap/src/reap/
-scp src/reap/model_util.py s_XXX@ssh.lightning.ai:/teamspace/studios/this_studio/reap/src/reap/
+cd reap && PYTHONPATH="src" python -m pytest tests/test_v4_*.py -v
 ```
 
-**What each patch does:**
+**What to check:** All V4 tests pass (block loader, observer, pipeline dispatch, prune, batched experts). 16 test_observer.py failures are pre-existing (Qwen3 compatibility with transformers 5.12.1) — ignore them, they don't affect V4.
 
-| File | Change |
-|------|--------|
-| `layerwise_model_utils.py:108-170` | `load_block_weights_from_safetensors` — try progressively shorter prefixes (`model.layers.0` → `layers.0`) to match safetensors keys; use `to_empty()` + re-assign instead of `.to(device)` for meta-safe device placement |
-| `layerwise_observer.py:296-340` | `_load_non_backbone_weights` — same prefix stripping for non-backbone modules; fallback to model-specific `NON_BACKBONE_KEY_MAP` when stripping doesn't match (e.g., `embed_tokens` → `embed`) |
-| `model_util.py:120-126` | Added `NON_BACKBONE_KEY_MAP` dict mapping safetensor prefixes to PyTorch module names for `DeepseekV4ForCausalLM` |
+**If tests fail:** Stop. Diagnose. The V4 tests must all pass before proceeding.
 
-## 5. Run 1 — keypa seed-10k (~45 min)
+### 0.3 — DeepSeek-V2-Lite-Chat smoke test (optional, non-V4 validation)
+
+Only needed if you changed non-V4 pipeline code. If you didn't, skip this.
 
 ```bash
+python scripts/patch_deepseek.py
 python -m reap.layerwise_prune \
-  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reaper-calibration" \
-  --dataset-config-name "seed-10k" \
-  --split "train" \
+  --model-name "deepseek-ai/DeepSeek-V2-Lite-Chat" \
+  --dataset-name "theblackcat102/evol-codealpaca-v1" \
+  --batch-size 1 \
+  --batches-per-category 2 \
+  --model-max-length 256 \
   --prune-method "reap" \
-  --compression-ratio 0.5 \
-  --batch-size 4 \
-  --batch-group-size 80 \
-  --batches-per-category 128 \
-  --model-max-length 4096 \
-  --output-file-name "keypa-seed10k-v4flash.pt" \
-  --overwrite-observations True \
-  --low_cpu_mem_usage True \
-  --save_intermediate True \
-  --do-eval false
+  --n-experts-to-prune 2 \
+  --do-eval False \
+  --run-observer-only True
 ```
 
-**Expected flow:**
-```
-Added 128 samples from category: all
-Total calibration samples: 128
-Loading model skeleton for deepseek-ai/DeepSeek-V4-Flash on meta device...
-Model loaded: DeepseekV4ForCausalLM
-Recording activations using layerwise processing...
-Found transformer blocks container: model.layers with 43 blocks
-Processing 43 blocks across 2 batch groups of up to 80 batches
-Block model.layers.0 weights loaded from disk
-Seeding replay cache from the first decoder block  ← ~2 min
-Processing block 1/43: model.layers.0               ← ~3 min per block
-...
-```
-    
-## 6. Run 2 — Sero 44K (~2-4 hours)
+**What to check:** 27 layers processed without error.
+
+**If it fails:** Likely `DynamicCache.get_usable_length` error — check transformers version. V2 patched file was written for 4.55.0 but `--v4` installs 5.12.1. If the error happens, the fix is in `scripts/patch_deepseek.py` (uses `get_seq_length()` fallback).
+
+---
+
+## Stage 1: GPU Environment (RTX PRO 6000, ~20-30 min)
+
+**Cost: $0 for setup** (GPU time not billed until you run). Download ~160 GB may take 10-20 min.
+
+### 1.1 — Launch GPU instance
 
 ```bash
-python -m reap.layerwise_prune \
-  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "0xSero/reap-calibration-data-v1" \
-  --split "train" \
-  --prune-method "reap" \
-  --compression-ratio 0.5 \
-  --batch-size 4 \
-  --batch-group-size 80 \
-  --batches-per-category 3500 \
-  --model-max-length 4096 \
-  --output-file-name "sero-full44k-v4flash.pt" \
-  --overwrite-observations True \
-  --low_cpu_mem_usage True \
-  --save_intermediate True \
-  --do-eval false
+lightning create --spot --accelerator gpu --gpu-type rtx-pro-6000 --name reap-v4
+```
+
+**What to expect:** Instance appears in Lightning AI dashboard in ~1-2 minutes. Spot means it can be preempted — save work regularly.
+
+**If launch fails:**
+- Check billing setup
+- Check spot availability (RTX PRO 6000 may not have spot capacity; try without `--spot`)
+- Try a different GPU type (A100-80GB at $2.19/hr would also work but costs more)
+
+### 1.2 — Clone and GPU torch
+
+```bash
+cd /teamspace/studios/this_studio
+git clone https://github.com/keypaa/reap.git
+cd reap
+git submodule update --init --recursive
+bash scripts/build.sh --v4
+source .venv/bin/activate
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+```
+
+**Verify CUDA:**
+```python
+import torch
+print(f"CUDA: {torch.cuda.is_available()}, VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.0f} GB")
+```
+Expected: `CUDA: True, VRAM: 96`
+
+### 1.3 — Download V4 Flash weights (~160 GB)
+
+```bash
+huggingface-cli login  # if not already logged in
+huggingface-cli download deepseek-ai/DeepSeek-V4-Flash
+```
+
+**What to expect:** Downloads to HF cache. Takes 10-20 min depending on bandwidth. ~160 GB total (FP4+FP8 shards, quantized).
+
+**Verify:**
+```python
+from reap.v4_block_loader import V4BlockDiskLoader
+loader = V4BlockDiskLoader("deepseek-ai/DeepSeek-V4-Flash")
+print(f"Layer map has {len(loader.layer_map)} layers")
+```
+Expected: 43 layers.
+
+**If download fails:**
+- Check disk space (`df -h`) — need at least 200 GB free
+- Try with `--resume-download` flag
+- If bandwidth is slow, you can use `--local-dir` to avoid repeated downloads
+
+### 1.4 — Verify V4 components import with CUDA
+
+```bash
+source .venv/bin/activate
+python -c "
+from reap.v4_block_loader import V4BlockDiskLoader
+from reap.v4_moe_observer import DeepseekV4MoEObserver
+from reap.v4_prune_utils import prune_v4_model
+from reap.layerwise_prune import main
+import torch
+print(f'All imports OK, device count: {torch.cuda.device_count()}')
+"
 ```
 
 ---
 
-## 7. Add Observer Config for DeepSeek-V4
+## Stage 2: 1-Layer Smoke Test (~$0.05, ~2 min)
 
-Model loaded with meta-tensor mode, but hit a second error:
+**Cost: ~$0.05** (2 min on RTX PRO 6000 at $1.46/hr). If this fails, you wasted a nickel.
+
+This is the FIRST time you touch real GPU compute. Do NOT skip this — it measures real per-layer timing and catches GPU-specific issues before a 43-layer run.
+
+### 2.1 — Smoke test script
+
+The script is in the repo at `scripts/test_v4_one_layer.py` (version-controlled, survives spot preemption).
+
+### 2.2 — Run it
+
+```bash
+PYTHONPATH="src" python scripts/test_v4_one_layer.py
 ```
-ValueError: No observer configuration for model 'DeepseekV4ForCausalLM'.
+
+**What to check:**
+- Output shape is `[1, seq_len, 4096]` or similar
+- Peak VRAM is well under 90 GB (should be ~14-15 GB)
+- The timing output — THIS is your real per-layer cost
+
+**If it fails:**
+- "No tensors found for block": safetensors key mismatch — check `v4_block_loader.py` prefix logic
+- "Cannot copy out of meta tensor": missing `to_empty()` call in weight loading
+- OOM (killed): Something is wrong — with 1 layer and 1 token it should use ~15 GB max. Check for memory leak.
+
+**Decision point:**
+- Timing < 10s per layer → full observation will be ~7 min per run (fast!)
+- Timing 30-60s per layer → full observation ~22-43 min per run
+- Timing > 120s per layer → something is wrong (maybe CPU→GPU transfer bottleneck)
+
+Write down the per-layer timing. You'll use it to estimate Stage 3 costs.
+
+---
+
+## Stage 3: Full V4 Flash Observation
+
+**Cost: TBD** — multiply your Stage 2 per-layer time × 43 layers × 4 runs. This is the most expensive stage.
+
+**Goal:** Run observer on all 43 layers with 4 different calibration datasets.
+
+### 3.1 — Important: Reuse your observation output path
+
+After Stage 3 runs, the output directory will be something like:
+```
+results/DeepSeek-V4-Flash/<dataset-name>/all/layerwise_observer.pt
 ```
 
-The `OBSERVER_CONFIG_REGISTRY` in `src/reap/observer.py` has entries for `DeepseekV2ForCausalLM` but not V4.
+Write down the exact path after the first run. You'll need it in Stage 4.
 
-### Investigation — Find MoE Module Attributes
+### 3.2 — Run 1: keypa/reaper-calibration[seed-10k]
 
-The observer uses `num_experts_attr_name` and `top_k_attr_name` to read expert count and top-k values from the MoE module via `getattr(module, attr_name)`. These must be actual attributes on the module object.
+```bash
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --batched-experts \
+  --expert-batch-size 16 \
+  --run-observer-only True
+```
 
-**Step 1: Confirm config values exist**
+**What to expect:**
+- 43 layers processed sequentially
+- 3 categories (math, code, agentic), ~10k samples total
+- Each category exhausts naturally (~3.3K max / 8 batch-size = ~412 batches)
+- 1024 is a safe upper bound — loop stops when samples run out
+- VRAM ~37 GB peak (block weights ~14.4 GB + transposed weight buffer ~17 GB + activations ~6 GB) — well within 96 GB
+- `--batched-experts` groups expert matmuls into 16-expert batches (~2K kernel launches per forward pass vs ~32K without), trading VRAM for speed
+
+**Monitoring:**
+```bash
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv -l 30
+```
+In another terminal:
+```bash
+tail -f results/DeepSeek-V4-Flash/reaper-calibration/layerwise/observer.log
+```
+
+**If it fails mid-run:**
+- OOM: Reduce `--batch-size` to 4. If still OOM, reduce to 2.
+- Layer X load error: Note which layer. Check if safetensors file for that layer exists.
+- Process killed by system (max RAM): Set `--low_cpu_mem_usage True` if available.
+- If partial data was saved, `--overwrite-observations True` to restart clean.
+
+### 3.3 — Run 2: keypa/reap-calibration-v1-full
+
+```bash
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-full" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --batched-experts \
+  --expert-batch-size 16 \
+  --run-observer-only True
+```
+
+**What to expect:**
+- 10 categories, 23,088 samples total
+- Each category exhausts naturally below the 1024 ceiling
+- Takes ~2.3× longer than Run 1 due to more categories and samples
+
+### 3.4 — Run 3: keypa/reap-calibration-v1-filtered
+
+```bash
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-filtered" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --batched-experts \
+  --expert-batch-size 16 \
+  --run-observer-only True
+```
+
+**What to expect:**
+- Same as Run 2 but 20,980 samples (no refusals/philosophy removed)
+- Slightly faster than Run 2 (~10% less data)
+
+### 3.5 — Run 4: 0xSero/structured-outputs-calibration-v1
+
+```bash
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "0xSero/structured-outputs-calibration-v1" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --batched-experts \
+  --expert-batch-size 16 \
+  --run-observer-only True
+```
+
+**What to expect:**
+- Single "all" category, 430 samples, no category field
+- Will exhaust at ~54 batches (430 / 8 = 53.75)
+- Fastest run by far — 430 samples vs 10k-23k for the others
+
+### 3.6 — Verify all observer data
+
 ```bash
 python -c "
-from transformers import AutoConfig
-config = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
-print('n_routed_experts:', config.n_routed_experts)
-print('num_experts_per_tok:', config.num_experts_per_tok)
-print('num_local_experts (alias):', config.num_local_experts)
+import torch, glob
+for f in sorted(glob.glob('results/DeepSeek-V4-Flash/*/all/layerwise_observer.pt')):
+    data = torch.load(f)
+    print(f'{f.split(\"/\")[3]:40s} layers={len(data)} experts={data[0][\"expert_frequency\"].shape[0]}')
 "
-```
-```
-n_routed_experts: 256
-num_experts_per_tok: 6
-num_local_experts (alias): 256
 ```
 
-**Step 2: List MoE module class and int attributes**
-```bash
-python -c "
-from transformers import AutoConfig, AutoModelForCausalLM
-from accelerate import init_empty_weights
-config = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
-with init_empty_weights():
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-for name, mod in model.named_modules():
-    if 'SparseMoe' in type(mod).__name__:
-        print(f'Module: {name} -> {type(mod).__name__}')
-        for attr in sorted(dir(mod)):
-            if not attr.startswith('_'): 
-                try:
-                    val = getattr(mod, attr)
-                    if isinstance(val, int) or isinstance(val, bool):
-                        print(f'  self.{attr} = {val}')
-                except: pass
-        break
-"
-```
-```
-Module: model.layers.0.mlp -> DeepseekV4SparseMoeBlock
-  call_super_init: False
-  dump_patches: False
-  is_hash: True    # <-- layer 0 uses hash routing, not learned routing
-  training: True
-```
-**Finding:** `DeepseekV4SparseMoeBlock` has no `num_experts`, `n_routed_experts`, or `top_k` directly. It has a `gate` submodule.
-
-**Step 3: Inspect the gate submodule**
-```bash
-python -c "
-from transformers import AutoConfig, AutoModelForCausalLM
-from accelerate import init_empty_weights
-config = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
-with init_empty_weights():
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-for name, mod in model.named_modules():
-    if 'SparseMoe' in type(mod).__name__:
-        gate = getattr(mod, 'gate', None)
-        if gate is not None:
-            print(f'  gate type: {type(gate).__name__}')
-            for attr in sorted(dir(gate)):
-                if not attr.startswith('_'):
-                    try:
-                        val = getattr(gate, attr)
-                        if isinstance(val, int):
-                            print(f'    gate.{attr} = {val}')
-                    except: pass
-        break
-"
-```
-```
-gate type: DeepseekV4HashRouter
-  gate.num_experts = 256
-  gate.top_k = 6
-  gate.call_super_init = False
-  gate.dump_patches = False
-  gate.hidden_dim = 4096
-  gate.training = True
-```
-**Finding:** The `gate` submodule has both `num_experts` (256) and `top_k` (6).
-
-**Step 4: Verify layer 3 (non-hash MoE) has same structure**
-```bash
-python -c "
-from transformers import AutoConfig, AutoModelForCausalLM
-from accelerate import init_empty_weights
-config = AutoConfig.from_pretrained('deepseek-ai/DeepSeek-V4-Flash', trust_remote_code=True)
-with init_empty_weights():
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-for name, mod in model.named_modules():
-    if 'layers.3.mlp' in name and 'SparseMoe' in type(mod).__name__:
-        gate = mod.gate
-        print(f'Layer 3 gate type: {type(gate).__name__}')
-        print(f'  gate.num_experts = {gate.num_experts}')
-        print(f'  gate.top_k = {gate.top_k}')
-        break
-"
-```
 Expected output:
 ```
-Layer 3 gate type: DeepseekV4TopKRouter
-  gate.num_experts = 256
-  gate.top_k = 6
+reaper-calibration[seed-10k]          layers=43 experts=256
+reap-calibration-v1-full              layers=43 experts=256
+reap-calibration-v1-filtered          layers=43 experts=256
+structured-outputs-calibration-v1     layers=43 experts=256
 ```
 
-**Conclusion:** Both hash-router and learned-router layers use `gate.num_experts` and `gate.top_k`. The observer's `reduce(getattr, ...)` path handles the dot notation — so `"gate.num_experts"` chains `getattr(mod, "gate")` then `getattr(gate, "num_experts")`.
+**If data is wrong:** If any layer has 0 experts or missing keys, re-run that dataset. If all 4 look correct, Stage 3 is done.
 
-### Patch `src/reap/observer.py`
+**Decision point before Stage 4:** The pruned models will use these observation files to decide which experts to remove. If the observation data is bad, the pruned models will be bad. Verify before proceeding.
 
-Add before the `OBSERVER_CONFIG_REGISTRY` dict (after the Glm44MoEObserverHookConfig block):
+---
 
-```python
-@dataclass
-class DeepseekV4MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "DeepseekV4SparseMoeBlock"
-    num_experts_attr_name: str = "gate.num_experts"
-    top_k_attr_name: str = "gate.top_k"
-    fused_experts: bool = False
-```
+## Stage 4: Prune + Eval (~24 min prune, eval TBD)
 
-And add to the registry:
-```python
-OBSERVER_CONFIG_REGISTRY = {
-    ...
-    "DeepseekV4ForCausalLM": DeepseekV4MoEObserverHookConfig,
-}
-```
+**Cost:** Prune ~$0.58 (24 min ÷ 60 × $1.46/hr for 4 prunes × ~6 min each). Eval cost is TBD — depends on how many benchmarks you run.
 
-### Apply the patch
+### 4.1 — Important: Parameter consistency
 
-Locally, on your Windows machine:
+Prune commands MUST use the same `--batch-size`, `--batches-per-category`, and `--model-max-length` as the corresponding observation run. The prune step reads cached observer data that was computed with those parameters — if they don't match, the pipeline may fail to find the cached data.
+
+### 4.2 — Prune all 4 models
+
 ```bash
-# Edit src/reap/observer.py to add the new config class
-# Then scp it to the instance
-scp src/reap/observer.py s_01kvnf22jcnc02d8814freks7k@ssh.lightning.ai:/teamspace/studios/this_studio/reap/src/reap/observer.py
+# After Run 1 — prune from seed-10k observations
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 2 — prune from v1-full observations
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-full" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 3 — prune from v1-filtered observations
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "keypa/reap-calibration-v1-filtered" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 4 — prune from structured-outputs observations
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "0xSero/structured-outputs-calibration-v1" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
 ```
 
-Or directly edit on the instance using a text editor (vim/nano).
+**What to check after each prune:**
+- Config shows `n_routed_experts=128` (was 256)
+- Config shows `num_local_experts=128`
+- Output is saved to `results/DeepSeek-V4-Flash/<dataset-name>/layerwise_0.50_*/`
 
-## Troubleshooting
+**If prune fails:**
+- "Observer data not found": Check paths. The prune step looks for cached observations from Stage 3 — did you use a different output directory?
+- "Mismatched parameters": Error message will say what parameter is wrong — fix and re-run
+- OOM during prune: Prune is just weight slicing (~6 min), should use minimal VRAM. If OOM, close other processes
 
-| Problem | Fix |
-|---------|------|
-| `ValueError: The checkpoint ... has model type deepseek_v4 but Transformers does not recognize this architecture` | Run `pip install git+https://github.com/huggingface/transformers.git "huggingface_hub>=0.34.0"` |
-| `third-party/evalplus does not appear to be a Python project` | Run `git submodule update --init --recursive` before install |
-| `scripts/build.sh: $'\r': command not found` | Don't use build.sh — use `uv pip install` directly |
-| Process killed by OOM (RAM full) | Must use `--low_cpu_mem_usage True` + `--batch-group-size 80` |
-| `No observer configuration for model 'DeepseekV4ForCausalLM'` | Add `DeepseekV4ForCausalLM` → `DeepseekV4MoEObserverHookConfig` entry to `OBSERVER_CONFIG_REGISTRY` in `observer.py` |
-| `No tensors found for block 'model.layers.0' in weight index` | Apply `layerwise_model_utils.py` patch (prefix stripping) |
-| `Cannot copy out of meta tensor; no data!` | Apply `layerwise_model_utils.py` patch (use `to_empty()` instead of `.to(device)`) |
-| `No weights found for non-backbone module: model.embed_tokens` | Update `NON_BACKBONE_KEY_MAP` in `model_util.py` |
+### 4.3 — Evaluate pruned models (optional but recommended)
 
+Upload pruned models to HF first for easier access:
+```bash
+huggingface-cli upload <your-repo> results/DeepSeek-V4-Flash/reaper-calibration/layerwise_0.50_*/
+```
+
+Then run eval (fill in your actual eval datasets):
+```bash
+# Eval a pruned model
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "results/DeepSeek-V4-Flash/reaper-calibration/layerwise_0.50_*/" \
+  --do-eval True \
+  --eval-datasets "user/dataset1,user/dataset2" \
+  --eval-batch-size 8 \
+  --eval-limit 1000
+
+# Eval original for baseline comparison
+PYTHONPATH="src" python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --do-eval True \
+  --eval-datasets "user/dataset1,user/dataset2" \
+  --eval-batch-size 8 \
+  --eval-limit 1000
+```
+
+**What to expect:** REAP typically shows <5% degradation at 50% compression.
+
+**If eval fails:** Check that `--do-eval True` loads the pruned model correctly. The V4 block loader should handle FP4→BF16 decompression automatically.
+
+---
+
+## Cost Tracking
+
+| Stage | GPU Minutes | Est. Cost | Notes |
+|-------|------------|-----------|-------|
+| 0: CPU Setup | 0 | $0 | Free tier |
+| 1: GPU Setup | 0 | $0 | Instance not running GPU work yet |
+| 2: 1-Layer Test | ~2 min | ~$0.05 | |
+| 3a: seed-10k obs | TBD | TBD | Fill from real timing |
+| 3b: v1-full obs | TBD | TBD | ~2.3× Run 1 (more categories) |
+| 3c: v1-filtered obs | TBD | TBD | ~90% of Run 2 |
+| 3d: structured-outputs obs | TBD | TBD | Fast (430 samples) |
+| 4a: Prune ×4 | ~24 min | ~$0.58 | |
+| 4b: Eval ×4 | TBD | TBD | |
+| **Total** | **TBD** | **TBD** | |
+
+To get real GPU time: after Stage 2.2, take `elapsed` seconds, multiply by 43 layers, then by number of runs.
+
+**IMPORTANT:** Lightning AI spot instances can be preempted. If you're in the middle of a 43-layer run and get kicked off, you lose progress (layerwise doesn't save mid-run). Consider:
+- Running during low-traffic hours
+- Having the resume command ready
+- Budgeting for a full-price instance if preemption is frequent
+
+---
+
+## Quick Reference — Stop/Continue Decisions
+
+| Situation | Action |
+|-----------|--------|
+| V4 unit tests fail | Stop. Fix before GPU. |
+| `build.sh --v4` fails on GPU instance | Stop. Try `pip install git+https://github.com/huggingface/transformers.git` |
+| CUDA not available after GPU torch install | Stop. Check driver, nvidia-smi. |
+| Weight download fails (network) | Retry with `--resume-download`. If disk full, clean up. |
+| 1-layer smoke test passes but timing > 120s | Continue, but budget more time. Consider reducing batch-size. |
+| 1-layer smoke test OOM | Stop. Something is very wrong (should use ~15 GB). |
+| Stage 3 run OOMs at layer 5 | Stop. Reduce `--batch-size` to 4, restart. |
+| Stage 3 run OOMs at layer 30 | Monitor VRAM trend. If leak, reduce batch-size and restart. |
+| Stage 3 gets preempted mid-run | Restart from scratch. Consider non-spot if preemption is frequent. |
+| Stage 4 says "observer data not found" | Stop. Check output paths match between Stage 3 and 4. |
+| Pruned model has 256 experts (not 128) | Prune didn't work — check compression-ratio. |
+| Eval crashes on model load | Pruned model weights may be corrupted. Re-run prune. |
+| Eval shows >10% degradation | Expected for some tasks at 50% compression. Compare all 4 datasets to see which did best. |
