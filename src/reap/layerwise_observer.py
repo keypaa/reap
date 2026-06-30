@@ -19,6 +19,7 @@ import gc
 import inspect
 import logging
 import pathlib
+import re
 
 import torch
 import torch.nn as nn
@@ -248,6 +249,17 @@ class LayerwiseMoEObserver:
         if not self.blocks or not (0 <= block_idx < len(self.blocks)):
             return None
         return self.blocks[block_idx]
+
+    def _actual_layer_idx(self, block_idx: int) -> int:
+        """Extract the actual layer number from block_names[block_idx].
+
+        When processing a subset of layers (e.g. --specific-layers "2"),
+        block_idx is the array index (0) but the actual layer number is 2.
+        This method extracts the real layer number from the block name.
+        """
+        name = self.block_names[block_idx]
+        m = re.search(r"\d+", name)
+        return int(m.group()) if m else block_idx
 
     def _move_block(self, block, block_idx: int, device: str) -> str:
         """
@@ -905,7 +917,8 @@ class LayerwiseMoEObserver:
 
             # Save intermediate results
             if save_path:
-                intermediate_path = save_path / f"block_{block_idx:03d}_metrics.pt"
+                layer_num = self._actual_layer_idx(block_idx)
+                intermediate_path = save_path / f"block_{layer_num:03d}_metrics.pt"
                 intermediate_path.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(self.state.get(block_idx, {}), intermediate_path)
                 logger.info(f"Saved intermediate results to {intermediate_path}")

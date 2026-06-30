@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# superpowers metadata
+.superpowers/
+.superpowers/**/*
+
 # reap specfic
 artifacts/
 scratch/

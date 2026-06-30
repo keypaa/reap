@@ -76,48 +76,193 @@ class TestFP4Dequantize:
         assert result.shape == (1, 2, 32)
         assert result.dtype == torch.bfloat16
 
+    def test_fp4_dequantize_e8m0_scales(self):
+        """E8M0 scale format: float8_e8m0fnu.to(float32) gives decoded value."""
+        packed = torch.zeros(1, 16, dtype=torch.int8)
+        packed[0, 0] = 0x01
+        arr = bytearray([130])
+        scales = torch.frombuffer(arr, dtype=torch.uint8).view(torch.float8_e8m0fnu).reshape(1, 1)
+        result = dequantize_fp4_weight(packed, scales)
+        assert result.shape == (1, 32)
+        # lut[1] = 0.5, scale for byte 130 = 2**(130-127) = 8.0 → 0.5 * 8.0 = 4.0
+        assert abs(result[0, 0].item() - 4.0) < 1e-6
+
+
+class TestRenameMap:
+    def test_attention_projection_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("attn.wq_a.weight") == "self_attn.q_a_proj.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.wq_b.scale") == "self_attn.q_b_proj.scale"
+        assert V4BlockDiskLoader._apply_rename_map("attn.wkv.weight") == "self_attn.kv_proj.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.wo_a.weight") == "self_attn.o_a_proj.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.wo_b.weight") == "self_attn.o_b_proj.weight"
+
+    def test_attention_norm_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("attn.q_norm.weight") == "self_attn.q_a_norm.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.kv_norm.weight") == "self_attn.kv_norm.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.attn_sink") == "self_attn.sinks"
+
+    def test_layer_norm_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("attn_norm.weight") == "input_layernorm.weight"
+        assert V4BlockDiskLoader._apply_rename_map("ffn_norm.weight") == "post_attention_layernorm.weight"
+
+    def test_hc_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("hc_attn_fn") == "self_attn.attn_hc.fn"
+        assert V4BlockDiskLoader._apply_rename_map("hc_attn_base") == "self_attn.attn_hc.base"
+        assert V4BlockDiskLoader._apply_rename_map("hc_attn_scale") == "self_attn.attn_hc.scale"
+        assert V4BlockDiskLoader._apply_rename_map("hc_ffn_fn") == "ffn_hc.fn"
+        assert V4BlockDiskLoader._apply_rename_map("hc_ffn_base") == "ffn_hc.base"
+        assert V4BlockDiskLoader._apply_rename_map("hc_ffn_scale") == "ffn_hc.scale"
+
+    def test_ffn_to_mlp_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("ffn.gate.weight") == "mlp.gate.weight"
+        assert V4BlockDiskLoader._apply_rename_map("ffn.gate.bias") == "mlp.gate.bias"
+
+    def test_compressor_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("attn.compressor.ape") == "self_attn.compressor.position_bias"
+        assert V4BlockDiskLoader._apply_rename_map("attn.compressor.norm.weight") == "self_attn.compressor.kv_norm.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.compressor.wgate.weight") == "self_attn.compressor.gate_proj.weight"
+        assert V4BlockDiskLoader._apply_rename_map("attn.compressor.wkv.weight") == "self_attn.compressor.kv_proj.weight"
+
+    def test_indexer_rename(self):
+        assert V4BlockDiskLoader._apply_rename_map("attn.indexer.compressor.ape") == "self_attn.compressor.indexer.position_bias"
+        assert V4BlockDiskLoader._apply_rename_map("attn.indexer.wq_b.weight") == "self_attn.compressor.indexer.q_b_proj.weight"
+
+    def test_fallthrough_no_match(self):
+        assert V4BlockDiskLoader._apply_rename_map("some_unknown.key") == "some_unknown.key"
+
+
+class TestClassifyTensors:
+    def _classify(self, names):
+        return V4BlockDiskLoader._classify_tensors(names)
+
+    def test_classify_per_expert(self):
+        names = [
+            "layers.0.ffn.experts.0.w1.weight",
+            "layers.0.ffn.experts.0.w1.scale",
+            "layers.0.ffn.experts.0.w2.weight",
+            "layers.0.ffn.experts.1.w1.weight",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert 0 in per_expert
+        assert 1 in per_expert
+        assert "w1" in per_expert[0]
+        assert "w2" in per_expert[0]
+        assert len(fallthrough) == 0
+
+    def test_classify_shared(self):
+        names = [
+            "layers.0.ffn.shared_experts.w1.weight",
+            "layers.0.ffn.shared_experts.w1.scale",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert "w1" in shared
+        assert len(per_expert) == 0
+
+    def test_classify_gate(self):
+        names = [
+            "layers.0.ffn.gate.weight",
+            "layers.0.ffn.gate.bias",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert "weight" in gate
+        assert "bias" in gate
+
+    def test_classify_hc(self):
+        names = [
+            "layers.0.hc_attn_fn",
+            "layers.0.hc_attn_base",
+            "layers.0.hc_ffn_fn",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert "hc_attn_fn" in hc
+        assert "hc_attn_base" in hc
+        assert "hc_ffn_fn" in hc
+
+    def test_classify_fallthrough(self):
+        names = [
+            "layers.0.attn_norm.weight",
+            "layers.0.ffn_norm.weight",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert len(fallthrough) == 2
+
+    def test_classify_compressor(self):
+        names = [
+            "layers.10.attn.compressor.ape",
+            "layers.10.attn.compressor.norm.weight",
+            "layers.10.attn.indexer.compressor.wgate.weight",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert len(compressor) == 3
+
+    def test_classify_tid2eid(self):
+        names = ["layers.0.ffn.gate.tid2eid"]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert "tid2eid" in gate
+
+    def test_classify_fp8_pairs(self):
+        names = [
+            "layers.0.attn.wq_a.weight",
+            "layers.0.attn.wq_a.scale",
+            "layers.0.attn.wkv.weight",
+            "layers.0.attn.wkv.scale",
+        ]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = self._classify(names)
+        assert "wq_a" in fp8
+        assert "wkv" in fp8
+        assert len(fallthrough) == 0
+
 
 class TestV4BlockDiskLoader:
     SAMPLE_WEIGHT_MAP = {
-        "model.layers.0.mlp.experts.0.w1.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.0.w1.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.0.w2.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.0.w2.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.0.w3.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.0.w3.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w1.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w1.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w2.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w2.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w3.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.experts.1.w3.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.gate.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.shared_experts.w1.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.shared_experts.w2.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.mlp.shared_experts.w3.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.q_a_proj.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.q_a_norm.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.q_b_proj.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.kv_proj.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.kv_norm.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.o_a_proj.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.o_b_proj.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.self_attn.sinks": "model-00001-of-00006.safetensors",
-        "model.layers.0.input_layernorm.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.post_attention_layernorm.weight": "model-00001-of-00006.safetensors",
-        "model.layers.0.attn_hc.fn": "model-00001-of-00006.safetensors",
-        "model.layers.0.attn_hc.base": "model-00001-of-00006.safetensors",
-        "model.layers.0.attn_hc.scale": "model-00001-of-00006.safetensors",
-        "model.layers.0.ffn_hc.fn": "model-00001-of-00006.safetensors",
-        "model.layers.0.ffn_hc.base": "model-00001-of-00006.safetensors",
-        "model.layers.0.ffn_hc.scale": "model-00001-of-00006.safetensors",
-        "model.layers.42.mlp.experts.0.w1.weight": "model-00006-of-00006.safetensors",
-        "model.layers.42.mlp.gate.weight": "model-00006-of-00006.safetensors",
-        "model.layers.42.self_attn.q_a_proj.weight": "model-00006-of-00006.safetensors",
-        "model.layers.42.input_layernorm.weight": "model-00006-of-00006.safetensors",
-        "embed_tokens.weight": "model-00001-of-00006.safetensors",
-        "model.norm.weight": "model-00006-of-00006.safetensors",
-        "lm_head.weight": "model-00006-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w1.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w1.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w2.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w2.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w3.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.0.w3.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w1.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w1.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w2.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w2.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w3.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.experts.1.w3.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.gate.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.gate.bias": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w1.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w1.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w2.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w2.scale": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w3.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn.shared_experts.w3.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wq_a.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wq_a.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wq_b.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wq_b.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wkv.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wkv.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wo_a.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wo_a.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wo_b.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.wo_b.scale": "model-00001-of-00006.safetensors",
+        "layers.0.attn.q_norm.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.kv_norm.weight": "model-00001-of-00006.safetensors",
+        "layers.0.attn.attn_sink": "model-00001-of-00006.safetensors",
+        "layers.0.attn_norm.weight": "model-00001-of-00006.safetensors",
+        "layers.0.ffn_norm.weight": "model-00001-of-00006.safetensors",
+        "layers.0.hc_attn_fn": "model-00001-of-00006.safetensors",
+        "layers.0.hc_attn_base": "model-00001-of-00006.safetensors",
+        "layers.0.hc_attn_scale": "model-00001-of-00006.safetensors",
+        "layers.0.hc_ffn_fn": "model-00001-of-00006.safetensors",
+        "layers.0.hc_ffn_base": "model-00001-of-00006.safetensors",
+        "layers.0.hc_ffn_scale": "model-00001-of-00006.safetensors",
+        "layers.42.ffn.experts.0.w1.weight": "model-00006-of-00006.safetensors",
+        "layers.42.ffn.gate.weight": "model-00006-of-00006.safetensors",
+        "layers.42.attn.wq_a.weight": "model-00006-of-00006.safetensors",
+        "layers.42.attn_norm.weight": "model-00006-of-00006.safetensors",
+        "embed.weight": "model-00001-of-00006.safetensors",
+        "norm.weight": "model-00006-of-00006.safetensors",
+        "head.weight": "model-00006-of-00006.safetensors",
     }
 
     @pytest.fixture
@@ -147,17 +292,17 @@ class TestV4BlockDiskLoader:
     def test_layer_tensor_map(self, mock_model_dir):
         loader = V4BlockDiskLoader(mock_model_dir)
         layer_0_tensors = loader.layer_map[0]
-        assert len(layer_0_tensors) == 32
-        assert all(t.startswith("model.layers.0.") for t in layer_0_tensors)
+        assert len(layer_0_tensors) == 41
+        assert all(t.startswith("layers.0.") for t in layer_0_tensors)
 
         layer_42_tensors = loader.layer_map[42]
         assert len(layer_42_tensors) == 4
-        assert all(t.startswith("model.layers.42.") for t in layer_42_tensors)
+        assert all(t.startswith("layers.42.") for t in layer_42_tensors)
 
     def test_load_tensor_raises_on_missing_shard(self, mock_model_dir):
         loader = V4BlockDiskLoader(mock_model_dir)
         with pytest.raises(safetensors.SafetensorError):
-            loader._load_tensor("model.layers.0.mlp.gate.weight")
+            loader._load_tensor("layers.0.ffn.gate.weight")
 
     def test_resolve_path_local_dir(self, mock_model_dir):
         resolved = V4BlockDiskLoader._resolve_path(mock_model_dir)
@@ -184,10 +329,22 @@ class TestV4BlockDiskLoader:
         loader = V4BlockDiskLoader(mock_model_dir)
         for layer_idx in loader.layer_map:
             for tensor_name in loader.layer_map[layer_idx]:
-                assert re.match(r"model\.layers\.\d+\.", tensor_name)
-        assert "embed_tokens.weight" not in loader.layer_map
-        assert "model.norm.weight" not in loader.layer_map
-        assert "lm_head.weight" not in loader.layer_map
+                assert re.match(r"layers\.\d+\.", tensor_name)
+        assert "embed.weight" not in loader.layer_map
+        assert "norm.weight" not in loader.layer_map
+        assert "head.weight" not in loader.layer_map
+
+    def test_classify_smoke(self, mock_model_dir):
+        loader = V4BlockDiskLoader(mock_model_dir)
+        names = loader.layer_map[0]
+        per_expert, stacked, shared, gate, hc, compressor, fp8, fallthrough = loader._classify_tensors(names)
+        assert len(per_expert) == 2
+        assert len(shared) == 3
+        assert "weight" in gate
+        assert "bias" in gate
+        assert len(hc) == 6
+        assert len(fp8) == 5
+        assert len(fallthrough) >= 4
 
 
 class TestDequantizeEdgeCases:
@@ -227,7 +384,6 @@ class TestDequantizeEdgeCases:
         assert torch.allclose(result, expected)
 
     def test_fp4_dequantize_non_divisible_raises(self):
-        # packed (1,2) → dequant (1,4), scales (1,3): 4 % 3 = 1 → error
         packed = torch.tensor([[0x01, 0x23]], dtype=torch.int8)
         scales = torch.tensor([[2.0, 4.0, 6.0]], dtype=torch.float32)
         with pytest.raises(ValueError, match="must be divisible by"):

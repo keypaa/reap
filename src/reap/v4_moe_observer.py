@@ -11,6 +11,7 @@ not as ModuleList of per-expert modules. This observer handles:
 from __future__ import annotations
 
 import gc
+import logging
 import re
 from typing import Any, Dict, Optional
 
@@ -18,9 +19,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from reap.layerwise_observer import LayerwiseMoEObserver
-from reap.layerwise_model_utils import cleanup_memory, has_meta_tensors, safe_get_device
+from reap.layerwise_observer import (
+    LayerwiseMoEObserver,
+    ReplayBatch,
+    _FirstblockInputCaptured,
+)
+from reap.layerwise_model_utils import (
+    cleanup_memory,
+    has_meta_tensors,
+    move_to_device,
+    safe_get_device,
+)
 from reap.pruning_metrics import update_pruning_state_single_expert
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekV4MoEObserver(LayerwiseMoEObserver):
@@ -45,21 +57,120 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
 
         self._offload_current_block()
 
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
         if self._v4_loader is not None:
             block = self._block_at(block_idx)
+            layer_idx = self._actual_layer_idx(block_idx)
             if has_meta_tensors(block):
-                self._v4_loader.load_into_block(block, block_idx)
+                self._v4_loader.load_into_block(block, layer_idx, target_device)
 
-        target_device = "cuda" if torch.cuda.is_available() else "cpu"
         final_device = self._move_block(self._block_at(block_idx), block_idx, target_device)
         self.currently_loaded_block_idx = block_idx
         return final_device
+
+    def _capture_first_block_inputs(self, data_batches):
+        """V4 override: embed tokens directly and call block 0 instead of the
+        full model forward, because remaining blocks (1-42) are on meta device
+        and would hang or error during a full forward pass."""
+        if not self.blocks:
+            raise ValueError("Layerwise replay requires at least one transformer block")
+
+        self.replay_cache.clear()
+
+        # Load block 0 from disk (everything: attention, norms, MoE)
+        device_str = self._load_block_for_replay(0)
+        target_device = torch.device(device_str)
+        entry_block = self.blocks[0]
+
+        captured_batches = []
+        embed = self.model.model.embed_tokens
+
+        def intercept_entry_inputs(_, args, kwargs):
+            replay_kwargs = {}
+            attention_mask = kwargs.get("attention_mask")
+            position_ids = kwargs.get("position_ids")
+            replay_inputs = [args[0].detach().cpu()]
+            _input_ids = kwargs.get("input_ids")
+            for key, value in kwargs.items():
+                if key in ("hidden_states", "attention_mask", "position_ids", "input_ids"):
+                    continue
+                replay_kwargs[key] = move_to_device(value, "cpu")
+            captured_batches.append(
+                ReplayBatch(
+                    inputs=replay_inputs,
+                    kwargs=self._sanitize_cached_block_kwargs(replay_kwargs),
+                    attention_mask=attention_mask.detach().cpu() if torch.is_tensor(attention_mask) else None,
+                    position_ids=position_ids.detach().cpu() if torch.is_tensor(position_ids) else None,
+                    input_ids=_input_ids.detach().cpu() if torch.is_tensor(_input_ids) else None,
+                )
+            )
+            raise _FirstblockInputCaptured
+
+        hook_handle = entry_block.register_forward_pre_hook(
+            intercept_entry_inputs, with_kwargs=True
+        )
+        logger.info("Seeding replay cache (V4 mode: direct block 0 call)")
+
+        try:
+            for batch in data_batches:
+                if isinstance(batch, torch.Tensor):
+                    input_ids = batch.unsqueeze(0) if batch.dim() == 1 else batch
+                elif isinstance(batch, dict):
+                    input_ids = batch.get("input_ids", batch.get("input_ids", None))
+                    if input_ids is None:
+                        raise ValueError(f"Batch dict missing input_ids: {batch.keys()}")
+                else:
+                    raise ValueError(f"Unsupported batch type: {type(batch)}")
+
+                hidden = embed(input_ids.to(target_device))  # [B, S, hidden]
+                hc_mult = getattr(self.model.config, "hc_mult", 1)
+                position_ids = torch.arange(input_ids.size(-1), dtype=torch.long, device=target_device).unsqueeze(0)
+                attention_mask = torch.ones_like(input_ids, device=target_device)
+                # Compute position_embeddings from the 3D hidden (before HC expansion)
+                # as the model does in DeepseekV4Model.forward
+                position_embeddings = {
+                    "main": self.model.model.rotary_emb(hidden, position_ids=position_ids, layer_type="main"),
+                    "compress": self.model.model.rotary_emb(hidden, position_ids=position_ids, layer_type="compress"),
+                }
+                # Expand to 4D [B, S, hc_mult, hidden] as the block expects
+                hidden = hidden.unsqueeze(2).expand(-1, -1, hc_mult, -1)
+
+                try:
+                    entry_block(
+                        hidden,
+                        position_embeddings=position_embeddings,
+                        position_ids=position_ids,
+                        attention_mask=attention_mask,
+                        input_ids=input_ids,
+                    )
+                except _FirstblockInputCaptured:
+                    continue
+        finally:
+            hook_handle.remove()
+
+        for batch in captured_batches:
+            self.replay_cache.append(
+                inputs=batch.inputs,
+                kwargs=batch.kwargs,
+                attention_mask=batch.attention_mask,
+                position_ids=batch.position_ids,
+                input_ids=batch.input_ids,
+            )
+        logger.info("Prepared replay cache for %s batches", len(self.replay_cache))
+
+        if not self.replay_cache:
+            raise ValueError("Replay cache did not capture any first-block inputs")
+
+        # Offload block 0 so the block loop starts clean
+        self._offload_current_block()
 
     def _offload_current_block(self):
         block_idx = self.currently_loaded_block_idx
         if block_idx < 0:
             return
         self.currently_loaded_block_idx = -1
+        if self._v4_loader is not None:
+            self._v4_loader.close()
         cleanup_memory(synchronize=False)
 
     @torch.inference_mode()
@@ -151,8 +262,12 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
         if block_idx not in self.state:
             self.state[block_idx] = self._initialize_block_state(num_experts)
 
-        # Detect hash router
+        # Detect hash router — two checks because DeepseekV4HashRouter doesn't
+        # expose an `is_hash` attribute despite being a hash-based router. The
+        # class-name fallback catches it for V4 Flash.
         is_hash = hasattr(moe_module.gate, 'is_hash') and moe_module.gate.is_hash
+        if not is_hash and type(moe_module.gate).__name__ == 'DeepseekV4HashRouter':
+            is_hash = True
 
         # Call router
         if is_hash:

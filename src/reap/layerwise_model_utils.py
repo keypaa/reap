@@ -276,8 +276,13 @@ def extract_model_components(
     modules_by_name = dict(model.named_modules())
 
     blocks = _find_blocks_container(modules_by_name, block_names)
+    if isinstance(blocks, nn.ModuleList) and len(blocks) > len(block_names):
+        # Container has more blocks than requested — use individual lookup
+        blocks = [modules_by_name[name] for name in block_names if name in modules_by_name]
+        logger.info("Resolved %d transformer blocks from container", len(blocks))
     if blocks is None:
         blocks = [modules_by_name[name] for name in block_names if name in modules_by_name]
+    if isinstance(blocks, list):
         logger.info("Collected %d individual transformer blocks", len(blocks))
 
     non_backbone_modules = _find_non_backbone_modules(
