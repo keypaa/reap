@@ -268,6 +268,9 @@ def main():
     # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = "{% for message in messages %}{{ message.role.capitalize() }}: {{ message.content }}\n{% endfor %}"
+        logger.info("Token has no chat_template — set default")
     model = None
 
     cached_data_path = _get_observer_output_path(
