@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Determine whether renting a B200 GPU (179 GB VRAM at $5-6/hr) enables running REAP on DeepSeek-V4-Flash (284B) with paper-standard calibration config (12,228 samples at 16,384 seq len) — and if not, what the fastest feasible path is.
+**Goal:** Determine the cheapest, fastest path to run REAP on DeepSeek-V4-Flash (284B) with paper-standard calibration (12,228 samples at 16,384 seq len). Evaluate B200 (179 GB, $5-6/hr) vs 8× A100-80GB (640 GB, $12/hr) vs staying on RTX PRO 6000 ($1.46/hr).
 
-**Architecture:** Three parallel paths evaluated: (A) keep RTX PRO 6000 layerwise with optimized throughput, (B) B200 with VRAM-resident FP4 weights for disk-less layerwise (~2-3× speedup), (C) multi-GPU cluster with tensor parallelism for true full-model forward (~50-100× speedup). Path selector at end.
+**Architecture:** Three paths evaluated: (A) keep RTX PRO 6000 layerwise with optimized throughput, (B) B200 with VRAM-resident FP4 weights for disk-less layerwise (~2-3× speedup), (C) multi-GPU cluster with tensor parallelism for true full-model forward (~50-100× speedup).
 
 **Tech Stack:** PyTorch 2.7+, CUDA 12.4+, transformers 5.12+, FlashAttention-4 (B200), V4BlockDiskLoader, vLLM (for multi-GPU path)
 
@@ -16,35 +16,74 @@
 - REAP paper spec for ≥110B: 12,228 samples at 16,384 seq len, no packing
 - Our current throughput: 5.6s/batch at 8192 seq len on RTX PRO 6000 (96 GB)
 - All changes must work on current fork (keypaa/reap), not upstream
-- No renting B200 until plan is verified (hard constraint)
+- **No renting anything until plan is fully verified (hard constraint)**
 
 ---
 
-## Research Findings (Pre-Plan)
+# ⚠️ THE CRITICAL INSIGHT: Path Cost Per Sample
 
-### B200 Capacity Reality
+Don't compare GPU cost/hr. Compare **cost per sample** — that's what actually matters.
+
+| Path | HW | Samples/hr | Cost/hr | **Cost per 1,000 samples** | Paper Standard? |
+|---|---|---|---|---|---|
+| **A** | RTX PRO 6000 | ~63 at 8192 | $1.46 | **$23.17** | ❌ |
+| **B** | B200 | ~100 at 8192 | $5.50 | **$55.00** | ❌ |
+| **C** | **8× A100-80GB** | **~12,228 at 16384** | **$12.00** | **$0.98** | ✅ |
+
+**Path B (B200) is the WORST value:** $55 per 1,000 samples — 56× more expensive than Path C, slower than Path A per dollar.
+
+**Path C (8× A100-80GB) is 56× cheaper per sample than B200 and 24× cheaper than RTX PRO 6000.**
+
+**One hour on 8× A100-80GB delivers more calibration data than 200 hours on RTX PRO 6000.**
+
+For all 4 datasets (48,912 samples):
+- Path C: **4 hours, $48** — paper-standard, done in a morning
+- Path A: **777 hours, $1,134** — would take a month
+- Path B: never finishes
+
+---
+
+# THE B200 TRAP
+
+**Do NOT rent a B200.** Here's why:
+
+1. **179 GB is not enough for full-model BF16** (needs 568 GB). You're stuck in layerwise mode.
+2. **B200 in layerwise mode is only 2-3× faster** than RTX PRO 6000 (memory bandwidth improvement, not compute) but costs **4× more per hour**.
+3. **Result: B200 processes fewer samples per dollar** than RTX PRO 6000 — it's slower per $, not faster.
+4. **Cannot reach paper standard** (12,228 at 16k) — layerwise has a fundamental 43× multiplier.
+
+**When WOULD B200 make sense?**
+- If you could keep ALL FP4 weights in VRAM (142 GB of 179 GB) AND run full-model forward (like vLLM does for serving)
+- This requires: custom CUDA kernels for on-the-fly FP4→BF16 dequant within each matmul
+- This is what vLLM does for DeepSeek-V3/R1 — but it's a massive engineering effort
+- Current vLLM doesn't support V4 Flash yet (as of July 2026)
+
+**Conclusion:** B200 is a dead end for this project. Skip it entirely.
+
+---
+
+## Research Findings
+
+### B200 Capacity Reality (For Reference Only — We're Not Using It)
 
 | Item | Size | Fits B200 (179 GB)? |
 |---|---|---|
 | FP4 weights (disk format) | ~142 GB | ✅ Yes, with 37 GB to spare |
 | BF16 weights (decompressed) | ~568 GB | ❌ No — need 4× B200 |
 | FP4 + KV cache (16k seq, bs=1) | ~142 + 25 GB = 167 GB | ✅ Marginal |
-| FP4 + KV cache (16k seq, bs=8) | ~142 + 40 GB = 182 GB | ❌ OOM |
 | FP4 + activations (observation, bs=1) | ~142 + 15 GB = 157 GB | ✅ |
 
-**Key constraint:** B200 alone cannot hold the full model in BF16. Only option is keeping FP4 weights in VRAM and dequantizing on-the-fly — same as layerwise, just without disk I/O.
+**Key constraint:** B200 alone cannot hold the full model in BF16.
 
 ### Speed Bottleneck Reality
 
-**Layerwise** (our current approach) requires 43 separate forward passes per batch — one per layer. Even if each layer's forward is 2× faster on B200, total time = `batches × 43 × per_layer_time`.
+Layerwise requires 43 separate forward passes per batch — one per layer.
 
 | Approach | Per-layer time | 12,228 batches × 43 layers | 1,000 batches × 43 layers |
 |---|---|---|---|
 | RTX PRO 6000 (current) | ~5.6s at 8192 | ~817 hrs | ~67 hrs |
 | B200 (FP4 VRAM cache, ~3× faster) | ~1.9s at 8192 | ~278 hrs | ~23 hrs |
-| B200 (FP4 VRAM cache, 16k seq, ~7.5s) | ~7.5s at 16384 | ~1,097 hrs | ~90 hrs |
-
-**Conclusion: B200 alone does not make 12,228 samples feasible.** The layerwise approach has a fundamental 43× multiplier that B200's ~3× speedup doesn't overcome.
+| B200 (16k seq, ~7.5s) | ~7.5s at 16384 | ~1,097 hrs | ~90 hrs |
 
 ### Where 12,228 Samples IS Feasible
 
@@ -52,26 +91,26 @@ The REAP paper ran on Cerebras CS-3 (wafer-scale) — the full model runs as one
 
 | Setup | Total VRAM | Full model forward? | Est. time for 12,228 batches at 16k |
 |---|---|---|---|
-| 8× A100-80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~30-45 min |
+| **8× A100-80GB (NVLink)** | 640 GB | ✅ (BF16, TP=8) | **~30-45 min** |
 | 8× H100-80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~20-30 min |
 | 2× B200 (NVLink) | 358 GB | ✅ (FP8, TP=2) | ~40-60 min |
 | 1× B200 | 179 GB | ❌ (BF16 OOM) | N/A |
 
 ### Fix Classification (Which of Our 9 Fixes Survive in Each Path)
 
-| # | Fix | Path A (RTX Layerwise) | Path B (B200 Layerwise) | Path C (Multi-GPU Full-Model) |
+| # | Fix | Path A (RTX Layerwise) | Path B (B200 — SKIP) | Path C (Multi-GPU) |
 |---|---|---|---|---|
-| 1 | total_tokens device fix | ✅ Needed | ✅ Needed | ✅ Needed (same pruning_metrics) |
-| 2 | FP8 compressor dequant | ✅ Needed | ✅ Needed | ✅ Needed (same weight format) |
-| 3 | 4D causal mask | ✅ Needed | ✅ Needed | ✅ Needed (same V4 arch) |
-| 4 | Block offload to meta | ✅ Needed | ✅ Needed | ❌ Not needed (no layerwise) |
-| 5 | Embed to target_device | ✅ Needed | ✅ Needed | ❌ Not needed |
-| 6 | data.py [subset] parse | ✅ Needed | ✅ Needed | ✅ Needed |
-| 7 | layerwise chat_template | ✅ Needed | ✅ Needed | ❌ Not needed |
-| 8 | BatchEncoding handling | ✅ Needed | ✅ Needed | ❌ Not needed (uses main.py) |
-| 9 | block.to(device) after load | ✅ Needed | ✅ Needed | ❌ Not needed |
+| 1 | total_tokens device fix | ✅ Needed | N/A | ✅ Needed (same pruning_metrics) |
+| 2 | FP8 compressor dequant | ✅ Needed | N/A | ✅ Needed (same weight format) |
+| 3 | 4D causal mask | ✅ Needed | N/A | ✅ Needed (same V4 arch) |
+| 4 | Block offload to meta | ✅ Needed | N/A | ❌ Not needed (no layerwise) |
+| 5 | Embed to target_device | ✅ Needed | N/A | ❌ Not needed |
+| 6 | data.py [subset] parse | ✅ Needed | N/A | ✅ Needed |
+| 7 | layerwise chat_template | ✅ Needed | N/A | ❌ Not needed |
+| 8 | BatchEncoding handling | ✅ Needed | N/A | ❌ Not needed (uses main.py) |
+| 9 | block.to(device) after load | ✅ Needed | N/A | ❌ Not needed |
 
-**Path C (multi-GPU) needs only fixes 1, 2, 3, 6** — the 4 V4-architecture fixes. Everything else is layerwise plumbing.
+**Path C needs only fixes 1, 2, 3, 6** — the 4 V4-architecture fixes. Everything else is layerwise plumbing.
 
 ---
 
@@ -138,144 +177,18 @@ Expected: All 43 layers complete without OOM. Check `nvidia-smi` after each laye
 
 ---
 
-## Path B: B200 with VRAM-Resident FP4 Weights (Same HW, New Mode)
+## Path B: B200 with VRAM-Resident FP4 Weights — SKIP
 
-**Cost:** $5-6/hr (vast.ai)
-**Feasible scale:** ~1,000-2,000 samples at 8192 seq len in 8-10 hrs
-**Status:** Requires adding `V4BlockVRAMLoader` — ~2-3 days of engineering
-
-### Task B1: Research Transformers & CUDA Compatibility on B200
-
-**Research/Verification — run on B200 rental (just basic check, 1 hr $5-6):**
-
-- [ ] Check `torch.cuda.get_device_capability()` returns (10, 0) on B200
-- [ ] Verify `torch.__version__` — needs ≥ 2.4 for Blackwell support
-- [ ] Check `CUDA_HOME` version ≥ 12.4
-- [ ] Test `torch.float8_e4m3fn` is available: `torch.tensor([1.0], dtype=torch.float8_e4m3fn)`
-- [ ] Check FlashAttention-4 availability: `import flash_attn; flash_attn.__version__`
-
-**If any check fails:** Abort Path B — B200 ecosystem not ready.
-
-**Testing commands:**
-```bash
-python -c "import torch; print(torch.cuda.get_device_capability(), torch.__version__)"
-python -c "import torch; t = torch.tensor([1.0], dtype=torch.float8_e4m3fn); print('FP8 OK')"
-python -c "import flash_attn; print('FA:', flash_attn.__version__)"
-```
-
-### Task B2: Build V4BlockVRAMLoader
-
-**Files:**
-- Create: `src/reap/v4_block_vram_loader.py`
-- Modify: `src/reap/v4_moe_observer.py` (select loader based on env)
-
-**Interfaces:**
-- Consumes: `model_path`, `config`, `device="cuda"` (must be GPU)
-- Produces: Same interface as `V4BlockDiskLoader.load_into_block(block, layer_idx, device)`
-
-Requires changing `load_non_backbone_modules` to work from VRAM-resident state dict.
-
-**Architecture:**
-`V4BlockVRAMLoader` extends `V4BlockDiskLoader` but overrides `_load_tensor()`:
-- On init: load all FP4/FP8 shard tensors into a single large GPU buffer (142 GB)
-- `_load_tensor()` reads from buffer instead of disk + safetensors
-- This removes ~0.3s of disk I/O per layer
-
-**Key risks:**
-- 179 GB VRAM means the buffer + single dequantized layer + activations must all fit
-- Buffer: 142 GB (FP4). Dequantized layer: ~3.5 GB (BF16). Activations: ~15-30 GB (bs=2, 8192). Total: ~161-175 GB. Marginal.
-- If OOM: reduce to bs=1 or use CPU buffer fallback
-
-- [ ] **Step 1: Research feasibility**
-
-```python
-# Estimate total VRAM usage — run on RTX PRO 6000 first to measure per-layer decompressed size
-# Already have this data: single layer ~14.4 GB BF16 weights
-# With VRAM buffer: 142 GB (FP4) + 14.4 GB (decomp layer, temporary) + 15 GB (activations)
-# = 171 GB — within 179 GB but tight
-```
-
-- [ ] **Step 2: Design the VRAM buffer**
-
-```python
-class V4BlockVRAMLoader(V4BlockDiskLoader):
-    """Like V4BlockDiskLoader but keeps all FP4 weights in a GPU buffer."""
-    def __init__(self, model_path, config=None, device="cuda"):
-        super().__init__(model_path, config)
-        self._vram_buffer = {}  # tensor_name -> fp4_tensor on GPU
-        self._buffer_device = torch.device(device)
-    
-    def _load_all_to_vram(self):
-        """Load all FP4/FP8 tensors from disk into GPU buffer."""
-        all_tensors = set(self.index["weight_map"].keys())
-        for shard_file in self._get_unique_shard_files(all_tensors):
-            tensors = safetensors.safe_open(shard_file, device=self._buffer_device.type)
-            for key in tensors.keys():
-                if key in all_tensors:
-                    self._vram_buffer[key] = tensors.get_tensor(key)
-        # ~142 GB allocated — VRAM should show ~142 GB used
-```
-
-- [ ] **Step 3: Write V4BlockVRAMLoader class** (full implementation)
-
-```python
-def _load_tensor(self, tensor_name):
-    if tensor_name in self._vram_buffer:
-        # Already on GPU — return reference
-        # For dequantization, the FP4 data stays in VRAM
-        return self._vram_buffer[tensor_name]
-    return super()._load_tensor(tensor_name)  # fallback to disk
-```
-
-- [ ] **Step 4: Modify layerwise observer to use VRAM loader**
-
-In `v4_moe_observer.py:61-66`:
-```python
-if self._v4_loader is not None:
-    block = self._block_at(block_idx)
-    layer_idx = self._actual_layer_idx(block_idx)
-    if has_meta_tensors(block):
-        self._v4_loader.load_into_block(block, layer_idx, target_device)
-```
-
-Add environment variable or auto-detect: if VRAM > 160 GB (i.e., B200), use VRAM loader.
-
-- [ ] **Step 5: CPU smoke test (no GPU needed)**
-
-```python
-# Create loader and test _load_tensor for a few layers
-# Verify same weights as disk loader
-```
-
-- [ ] **Step 6: GPU smoke test (on RTX PRO 6000 first)**
-
-Run 1-2 layers with VRAM loader on RTX PRO 6000 (will OOM on full buffer but test partial load).
-Verify dequantized weights match disk-loaded weights exactly.
-
-- [ ] **Step 7: B200 full test (rent B200, 1 hr ~$5-6)**
-
-Same command as current but with VRAM loader. Check:
-- VRAM at idle (after buffer load): ~142 GB
-- VRAM during layer forward: ~170 GB (within 179 GB)
-- Timing: should be ~3-4s/it (vs 5.6s on RTX PRO 6000)
-
-### Task B3: Retune Batch Size on B200
-
-**Files:**
-- No changes — empirical
-
-**Verification:**
-- [ ] Try `--batch-size 2 --expert-batch-size 32` on B200
-- [ ] Measure VRAM peak, speed
-- [ ] Compute max samples per hour
+**Do not pursue.** See "The B200 Trap" above. $55 per 1,000 samples is the worst value of any option, and it can't reach paper-standard calibration anyway.
 
 ---
 
 ## Path C: Multi-GPU Full-Model Forward (~100× Speedup)
 
-**Cost:** $10-30/hr (8× A100-80GB on runpod/vast)
-**Feasible scale:** ~12,228 samples at 16,384 seq len in ~30-60 min
-**Status:** Major engineering effort — needs vLLM integration or tensor parallelism
+**Cost:** $12/hr on vast.ai for 8× A100-80GB (640 GB total, NVLink)
+**Feasible scale:** 12,228 samples at 16,384 seq len in ~30-60 min
+**Total for all 4 datasets:** ~4 hours, ~$48
+**Status:** Major engineering effort — needs standard REAP observer adapted for V4 on multi-GPU
 
 ### Why This Is the Only Path to Paper-Standard Calibration
 
@@ -288,32 +201,145 @@ The core issue: even with all FP4 weights in VRAM (Path B), layerwise requires 4
 One forward pass for 284B on 8× A100-80GB: ~0.15-0.3 seconds at 16k seq len.
 12,228 batches × 0.3s = ~1 hour.
 
+---
+
+## Cost Summary (All Paths)
+
+### Observation (Single Dataset)
+
+| Path | HW | Samples | Samples/hr | Time | **Cost** | Cost per 1k samples | Paper Standard? |
+|---|---|---|---|---|---|---|---|
+| **A** | RTX PRO 6000 | 500 at 8192 | 63 | 8 hrs | **$11.68** | $23.17 | ❌ |
+| **B (SKIP)** | 1× B200 | 1,000 at 8192 | 100 | 10 hrs | **$55.00** | $55.00 | ❌ |
+| **C ⭐** | **8× A100-80GB** | **12,228 at 16384** | **12,228** | **1 hr** | **$12.00** | **$0.98** | **✅ Full** |
+
+### All 4 Datasets (Observation + Prune + Eval)
+
+| Path | Total Time | **Total Cost** | Paper Standard? |
+|---|---|---|---|
+| A (current) | 32 hrs | **$46.72** | ❌ |
+| B (SKIP) | 40+ hrs | **$200-240** | ❌ |
+| **C ⭐** | **6 hrs (4 obs + 1 prune + 1 eval)** | **~$72** | **✅ Yes** |
+
+---
+
+## ⚠️ CRITICAL: 4 Pre-Flight Verifications Before Renting Anything
+
+**We cannot rent 8× A100-80GB until ALL of these pass.** No exceptions. Each item below must be checked and confirmed working on our current hardware (RTX PRO 6000 or CPU) before spending a cent on multi-GPU.
+
+### Verification 1: Can the model load across 8 GPUs with device_map="auto"?
+
+**What we need to know:** The standard REAP pipeline (`main.py`) uses `device_map="auto"` which relies on Hugging Face `accelerate` to split the model across GPUs. We need to verify this works for V4.
+
+**Check without renting:**
+- [ ] Read `main.py` line 119-125 — understand why V4 is blocked (it just raises RuntimeError for any V4 model)
+- [ ] Read `model_util.py` — check if V4 is registered in `MODEL_ATTRS` with correct MoE submodule path
+- [ ] Read `observer.py` `OBSERVER_CONFIG_REGISTRY` — check if V4 has an observer config (it doesn't — needs to be added)
+- [ ] On Lightning RTX PRO 6000: try loading V4 model with `device_map="auto"` on a single GPU (will OOM on full model but tests the accelerate integration):
+  ```python
+  from transformers import AutoConfig, AutoModelForCausalLM
+  config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-V4-Flash", trust_remote_code=True)
+  # This should fail gracefully, not with a confusing error
+  model = AutoModelForCausalLM.from_pretrained(
+      "deepseek-ai/DeepSeek-V4-Flash",
+      device_map="auto",
+      torch_dtype="auto",
+      trust_remote_code=True,
+  )
+  ```
+
+**Pass criteria:** The error (if any) should be a CUDA OOM, not a code crash. That means accelerate attempted GPU placement and ran out of VRAM — it WOULD work with 8 GPUs. If it crashes with `KeyError`, `AttributeError`, or other code error, Path C is blocked.
+
+### Verification 2: Do standard MoE hooks work on V4's MoE structure?
+
+**What we need to know:** The `MoETransformerObserver` registers hooks on `MODEL_ATTRS[model_class]["moe_path"]` submodules. We need to find the correct path for V4's MoE.
+
+**Check without renting:**
+- [ ] On Lightning RTX PRO 6000: load layer 0 (with our existing `V4BlockDiskLoader`), then inspect its MoE structure:
+  ```python
+  from transformers import AutoConfig
+  from reap.v4_block_loader import V4BlockDiskLoader
+  import torch
+  
+  config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-V4-Flash", trust_remote_code=True)
+  loader = V4BlockDiskLoader("deepseek-ai/DeepSeek-V4-Flash", config=config)
+  
+  # Create a meta block and load it to CPU
+  from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4DecoderLayer
+  with torch.device("meta"):
+      block = DeepseekV4DecoderLayer(config, layer_idx=0)
+  loader.load_into_block(block, 0, "cpu")
+  
+  # Inspect MoE submodule
+  moe = block.mlp  # or wherever the MoE is
+  print(type(moe))
+  print([n for n, _ in moe.named_modules()])
+  print(hasattr(moe, 'gate'), hasattr(moe, 'experts'))
+  ```
+- [ ] Based on output, determine the correct `moe_path` for `MODEL_ATTRS`
+- [ ] Verify that forward hooks on this path would capture: `router_logits` (from gate) and expert activations (from experts)
+
+**Pass criteria:** V4's MoE module has `gate` and `experts` submodules that match the hook pattern used by `MoETransformerObserver`. If V4 uses a completely different MoE structure (e.g., `DeepseekV4Experts` is not a standard `nn.ModuleList`), we need custom hook code.
+
+### Verification 3: Does the standard observer data format match what prune.py expects?
+
+**What we need to know:** `prune.py` (or `v4_prune_utils.py`) reads observer data to decide which experts to remove. The standard observer and the layerwise observer may save data in different formats.
+
+**Check without renting:**
+- [ ] Read `pruning_metrics.py` `initialize_pruning_state()` — this defines the state dict format
+- [ ] Read `layerwise_observer.py` `_record_all_blocks_for_batch_group()` — see what gets saved
+- [ ] Read `observer.py` `record_all_blocks()` — see what the standard observer saves
+- [ ] Compare: are the state dict keys identical? (total_tokens, expert_frequency, pairwise_expert_frequency, ean_sum, weighted_ean_sum, ean_mean)
+- [ ] Read `v4_prune_utils.py` — does the prune step read from observer state and how?
+- [ ] Read `prune.py` — does it call `initialize_pruning_state` and expect the same keys?
+
+**Pass criteria:** Both observers produce data with the same keys/format from `initialize_pruning_state`. If they differ, we need a format adapter.
+
+### Verification 4: Can prune.py handle observation results from the standard pipeline?
+
+**What we need to know:** `prune.py` may have code paths specific to the layerwise pipeline (e.g., checking for file naming, block indices, etc.).
+
+**Check without renting:**
+- [ ] Read `prune.py` end-to-end: how does it load observer data?
+- [ ] Read `main.py` `main()` function: how does it save observer data?
+- [ ] Compare file naming conventions
+- [ ] Create a mock observer data file (using `initialize_pruning_state` for all 43 layers) and test if `prune.py` can read it
+- [ ] If `prune.py` references layerwise-specific paths (e.g., `results/.../layerwise/...`), note what needs to change
+
+**Pass criteria:** A mock observer data file with the correct format can be loaded by the prune pipeline without crashes. If `prune.py` and `main.py` use different file formats, list the exact changes needed.
+
+---
+
+## Path C Implementation (If Pre-Flight Passes)
+
 ### Task C1: Determine Best Multi-GPU Platform
 
 **Research — no code:**
 
-- [ ] Compare: runpod (8× A100-80GB, ~$13-20/hr), vast.ai (8× A100-80GB, ~$10-15/hr), Lambda Labs (8× A100-80GB, ~$15/hr)
-- [ ] Check: does runpod have B200 clusters? (likely not yet)
-- [ ] Check: does vast.ai offer 2×B200 instances? (NVLink required for TP)
-- [ ] Report: cheapest platform with NVLink-connected GPUs
+- [ ] Compare: runpod (8× A100-80GB, ~$13-20/hr), vast.ai (8× A100-80GB, 256 cores, 2,032 GB RAM, 25 TB SSD, **$12/hr**), Lambda Labs (8× A100-80GB, ~$15/hr)
+- [ ] Check: do these have NVLink between GPUs? (Required for tensor parallelism without CPU bottlenecks)
+- [ ] Check: does vast.ai's 8× A100-80GB instance have NVLink? (If not, performance drops ~2×)
+- [ ] Report: cheapest platform WITH NVLink
 
 ### Task C2: Research vLLM for Full-Model Observation
 
 **Research — no code:**
 
-vLLM already supports tensor parallelism for DeepSeek V4 (it's the standard serving framework for V4). The question: can we use vLLM's forward pass for observation instead of raw PyTorch?
+vLLM already supports tensor parallelism for DeepSeek V4 (it's the standard serving framework). The question: can we use vLLM's forward pass for observation instead of raw PyTorch?
 
 - [ ] Check if vLLM exposes router logits or can be hooked
-- [ ] Check if vLLM supports FP4 weights directly (it does for DeepSeek-V3, likely for V4)
+- [ ] Check if vLLM supports FP4 weights directly (it does for DeepSeek-V3, likely for V4 Flash too)
 - [ ] If vLLM works: observation becomes `vllm.engine.forward()` with hooks → much simpler than our layerwise
+- [ ] If vLLM doesn't work: fall back to raw PyTorch with `accelerate`
 - [ ] Return: feasibility assessment
 
 ### Task C3: Adapt Standard REAP Pipeline for V4
 
 **Files:**
-- Modify: `src/reap/main.py` (remove V4 guard at line 121-125)
-- Modify: `src/reap/observer.py` (register V4 MoE hooks)
-- Modify: `src/reap/model_util.py` (add V4 to MODEL_ATTRS for standard observer)
+- Modify: `src/reap/main.py` — remove V4 guard (line 121-125)
+- Modify: `src/reap/observer.py` — add V4 observer config to `OBSERVER_CONFIG_REGISTRY`
+- Modify: `src/reap/model_util.py` — add V4 entry to `MODEL_ATTRS` with correct `moe_path`
+- Possibly create: `src/reap/models/modeling_deepseek_v4_patch.py` (if router logits aren't exposed)
 
 If vLLM is usable:
 - Use vLLM engine with tensor parallelism
@@ -326,49 +352,33 @@ If vLLM is not usable:
 - Register standard MoE hooks via `MoETransformerObserver`
 - Run: `python -m reap.main ...` (standard pipeline)
 
-**Key insight:** The standard observer (`MoETransformerObserver`) uses forward hooks that trigger on every MoE block automatically during a single forward pass. No layerwise replay needed. This is what the upstream REAP code does.
+**Key insight:** The standard observer (`MoETransformerObserver`) uses forward hooks that trigger on every MoE block automatically during a single forward pass. No layerwise replay needed. This is what the upstream REAP code does for all non-V4 models.
 
 ### Task C4: Full Verification Run on Multi-GPU
 
 **Files:**
 - No changes — run existing pipeline if adapted
 
-**Verification:**
-- [ ] Load DeepSeek-V4-Flash on 8× A100-80GB with device_map="auto"
-- [ ] Run 1 batch: verify all 43 layers' metrics collected
-- [ ] Run 1228 batches (10% of 12,228): measure time, verify no OOM
-- [ ] Project full 12,228 time from measured throughput
+**Verification (on rented 8× A100-80GB, 1 hr min ~$12):**
 
-### Task C5: Prune on Multi-GPU
+- [ ] Run 1 batch at 16384 seq len: verify all 43 layers' metrics collected without OOM
+- [ ] Run 10 batches: measure per-batch time
+- [ ] Check VRAM distribution across 8 GPUs (should be balanced ~70-75 GB each)
+- [ ] Run 1228 batches (10% of 12,228): verify no memory leak, no crash
+- [ ] Project full 12,228 time from measured throughput
+- [ ] Save observer data and verify format matches `prune.py` expectations
+
+### Task C5: Prune on Single GPU
 
 **Files:**
-- Modify: `src/reap/prune.py` or `src/reap/v4_prune_utils.py`
+- Modify: `src/reap/prune.py` or `src/reap/v4_prune_utils.py` (if needed)
 
-Pruning (weight removal) is much simpler than observation — it's just weight tensor reshaping. Can likely run on a single GPU.
+Pruning (weight removal) is much simpler than observation — it's just weight tensor reshaping. Can run on a single GPU or even CPU.
 
-- [ ] Verify pruned model weights can be saved
-- [ ] Verify pruned model can be loaded for eval
-
----
-
-## Cost Comparison (All Paths)
-
-### Observation (Single Dataset)
-
-| Path | HW | Est. Samples | Est. Time | Est. Cost | Paper Standard? |
-|---|---|---|---|---|---|
-| **A** (current) | RTX PRO 6000 | 500 at 8192 | 8 hrs | $11.68 | ❌ (4% coverage) |
-| **B** (B200 layerwise) | 1× B200 | 1,000 at 8192 | 10 hrs | $50-60 | ❌ (8% coverage) |
-| **C** (multi-GPU) | 8× A100-80GB | 12,228 at 16384 | 1 hr | $13-20 | ✅ Full |
-| **C** (multi-GPU, 4 datasets) | 8× A100-80GB | 48,912 total | 4 hrs | $52-80 | ✅ Full |
-
-### Observation + Prune + Eval (4 Datasets)
-
-| Path | Est. Total | Est. Cost |
-|---|---|---|
-| A (current) | 32 hrs | $46.72 |
-| B (B200) | 40+ hrs | $200-240 |
-| C (multi-GPU) | 6 hrs (4 obs + 1 prune + 1 eval) | $78-120 |
+- [ ] Load observer data from Path C4
+- [ ] Verify prune produces pruned model with 128 experts (50% compression)
+- [ ] Save pruned model
+- [ ] Verify saved model can be loaded (at least the config shows 128 experts)
 
 ---
 
@@ -379,46 +389,34 @@ Pruning (weight removal) is much simpler than observation — it's just weight t
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | Memory leak not fully fixed | Medium | Test on Lightning first. If leak persists, add explicit `del` + `torch.cuda.empty_cache()` |
-| Layer 0-2 pass but later layers OOM from KV cache growth | Low | No KV cache in observation mode — no past_key_values |
 | spot instance preemption mid-run | Medium | Save intermediate results (already done: `save_path` param) |
-| 500 samples insufficient for REAP convergence | Medium | This is the tradeoff — accept or switch to Path C |
-
-### Path B Risks (B200)
-
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| 179 GB VRAM insufficient even for FP4 buffer + activations | Medium | Test on single batch first. If OOM, reduce buffer to CPU and stream to GPU |
-| B200 CUDA 12.4+ not available on vast.ai | Medium | Check before renting. Use `torch.cuda.is_available()` test |
-| FlashAttention-4 not available for V4 | Medium | Fall back to eager attention (slower but works) |
-| $5-6/hr rental but only 2-3× speedup = poor ROI | High | Pre-compute ROI before renting — if ROI < 2× over RTX, skip |
+| 500 samples insufficient for eval | Medium | Accept the tradeoff or switch to Path C |
 
 ### Path C Risks (Multi-GPU)
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Standard observer hooks don't work with V4's MoE structure | Medium | Add V4-specific hook config to OBSERVER_CONFIG_REGISTRY |
-| device_map="auto" on 8 GPUs fails for V4 | Medium | Try accelerate launcher first; test on single batch |
+| Standard observer hooks don't work with V4's MoE structure | Medium | Add V4-specific hook config to OBSERVER_CONFIG_REGISTRY (Verification 2) |
+| device_map="auto" on 8 GPUs fails for V4 | Medium | Try accelerate launcher first; test on single batch (Verification 1) |
 | vLLM doesn't expose router logits (can't compute REAP score) | High | Fall back to raw PyTorch with accelerate |
-| Multi-GPU spot cost higher than expected | Low | Use on-demand for the 1-hour run ($20) |
-| Pruning code assumes layerwise observation format | High | Need to align observation data format with what prune step expects |
+| Multi-GPU spot cost higher than expected | Low | Use on-demand for the 1-hour run ($12) |
+| Pruning code assumes layerwise observation format | High | Need format adapter (Verification 3+4) |
 
 ---
 
 ## Decision Tree
 
 ```
-Is 500-800 samples at 8192 enough for your eval?
-├── YES → Use Path A (continue with RTX PRO 6000, $11.68/run)
+Can you accept ~500 samples at 8192 seq len for eval?
+├── YES → Use Path A (RTX PRO 6000, $11.68/run)
 │
-└── NO → Is $50-60/dataset acceptable for 2× samples?
-    ├── YES → Use Path B (B200 layerwise, need 2-3 days engineering)
-    │
-    └── NO → Go Path C (multi-GPU full model)
-        ├── Requires: 4 V4-specific fixes (already done)
-        ├── Requires: Remove V4 guard in main.py + hook registration
-        ├── Requires: Multi-GPU platform account
-        ├── Cost: ~$20/hr × 6 hrs = $120 total for all 4 datasets
-        └── Delivers: Paper-standard 12,228 samples at 16,384 seq len
+└── NO → Must go Path C: 8× A100-80GB
+    ├── Complete 4 Pre-Flight Verifications (takes 1-2 days)
+    ├── Implement Path C code changes (takes 2-3 days)
+    ├── Rent 8× A100-80GB for verification run ($12)
+    ├── Run all 4 datasets ($48 total)
+    ├── Prune + eval (~$12)
+    └── Total: ~$72, 3-5 days engineering + 6 hours compute
 ```
 
 ---
@@ -427,17 +425,12 @@ Is 500-800 samples at 8192 enough for your eval?
 
 1. **Fix the memory leak** — commit `91c5a44` (already pushed)
 2. **Test Path A throughput on Lightning** — verify all 43 layers pass, measure speed
-3. **Decide** — based on whether 500-800 samples is enough
-
-If Path C:
-4. Research vLLM hooks or accelerate-based loading for V4 (Task C2)
-5. Remove V4 guard in main.py (Task C3)
-6. Test on 1 GPU with small batch first
-7. Rent 8× A100-80GB for the run
+3. **Run 4 Pre-Flight Verifications** (can be done on current HW, no renting needed)
+4. **Decide** based on pre-flight results
 
 ---
 
-## Appendix: What B200 Actually Changes
+## Appendix: What B200 Actually Changes (For Reference)
 
 **B200 vs RTX PRO 6000 specs:**
 
@@ -450,5 +443,8 @@ If Path C:
 | Flash attention | FA3 | FA4 | gen bump |
 | Cost/hr (spot) | ~$1.46 | ~$5-6 | 3.4-4.1× |
 | VRAM for FP4 weights | ❌ Cannot hold | ✅ Can hold (142 GB) | — |
+| **Cost per 1,000 samples** | **$23.17** | **$55.00** | **0.42× value** |
 
-**Key takeaway:** B200's advantage is primarily VRAM capacity (allowing FP4 buffer), not compute speed. For the attention-dominated layerwise workload, memory bandwidth (4×) matters more than compute, giving ~2-3× real-world speedup over RTX PRO 6000.
+B200 is NOT worth it for this workload. The 4× memory bandwidth is neutralized by the 4× higher cost and the fundamental 43× layerwise multiplier.
+
+**The only scenario where B200 wins:** If and when vLLM adds native DeepSeek-V4-Flash support with on-the-fly FP4→BF16 dequantization within each matmul kernel. Then a single B200 could run full-model forward at FP4 precision (142 GB in 179 GB VRAM) without the 43× multiplier. As of July 2026, this doesn't exist yet.
