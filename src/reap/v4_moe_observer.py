@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformers
 
 from reap.layerwise_observer import (
     LayerwiseMoEObserver,
@@ -115,7 +116,7 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
             for batch in data_batches:
                 if isinstance(batch, torch.Tensor):
                     input_ids = batch.unsqueeze(0) if batch.dim() == 1 else batch
-                elif isinstance(batch, dict):
+                elif isinstance(batch, (dict, transformers.tokenization_utils_base.BatchEncoding)):
                     input_ids = batch.get("input_ids", batch.get("input_ids", None))
                     if input_ids is None:
                         raise ValueError(f"Batch dict missing input_ids: {batch.keys()}")
