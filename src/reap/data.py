@@ -208,6 +208,13 @@ def parse_composite_dataset_spec(
 
 def _load_raw_dataset(dataset_name, split, subset=None):
     """Load a raw HuggingFace dataset, handling special cases like C4."""
+    # Parse [subset] from dataset name if not explicitly provided
+    # e.g. "keypa/reaper-calibration[seed-10k]" → name="keypa/reaper-calibration", subset="seed-10k"
+    if subset is None and "[" in dataset_name and dataset_name.endswith("]"):
+        bracket_start = dataset_name.index("[")
+        subset = dataset_name[bracket_start + 1 : -1]
+        dataset_name = dataset_name[:bracket_start]
+
     try:
         if dataset_name == "allenai/c4":
             file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
@@ -237,10 +244,15 @@ def load_category_batches(
     truncate,
     batches_per_category,
 ):
+    # Strip [subset] from dataset_name for registry lookup
+    clean_name = dataset_name
+    if "[" in dataset_name and dataset_name.endswith("]"):
+        clean_name = dataset_name[: dataset_name.index("[")]
+
     raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
 
     # load dataset processor
-    proc_cls = DATASET_REGISTRY.get(dataset_name)
+    proc_cls = DATASET_REGISTRY.get(clean_name)
     if proc_cls is None:
         raise ValueError(
             f"No DatasetProcessor registered for '{dataset_name}'. "
