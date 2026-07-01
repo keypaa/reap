@@ -537,6 +537,10 @@ class V4BlockDiskLoader:
         block.to_empty(device=device)
         
         block.load_state_dict(state_dict, strict=False, assign=True)
+        # load_state_dict with assign=True replaces the CUDA meta tensor with
+        # the CPU tensor from state_dict. to() ensures everything lands on
+        # the target device (critical for GPU, no-op if already on device).
+        block.to(device)
         return block
 
     def unload_layer(self, layer, clear_shard_cache=False):
