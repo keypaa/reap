@@ -439,10 +439,31 @@ class V4BlockDiskLoader:
             state_dict[model_key] = tensor
 
     def _process_compressor_tensors(self, compressor_tensors, state_dict):
+        stripped_to_name = {s: n for s, n in compressor_tensors.items()}
+        fp8_paired_scales = set()
+
+        # Handle all weights first (potential FP8 pairs)
         for stripped, tensor_name in compressor_tensors.items():
+            if not stripped.endswith(".weight"):
+                continue
+            scale_stripped = stripped.replace(".weight", ".scale")
+            scale_name = stripped_to_name.get(scale_stripped)
             tensor = self._load_tensor(tensor_name)
             model_key = self._apply_rename_map(stripped)
-            state_dict[model_key] = tensor
+            if tensor.dtype in _FP8_DTYPES and scale_name is not None:
+                dequant = self._dequant_weight(tensor_name, scale_name)
+                state_dict[model_key] = dequant
+                fp8_paired_scales.add(scale_stripped)
+            else:
+                state_dict[model_key] = self._to_bf16(tensor)
+
+        # Handle remaining non-weight, non-scale tensors (bias, norm, etc.)
+        for stripped, tensor_name in compressor_tensors.items():
+            if not stripped.endswith(".weight"):  # weights done above
+                if stripped not in fp8_paired_scales:  # skip scales consumed by FP8 dequant
+                    tensor = self._load_tensor(tensor_name)
+                    model_key = self._apply_rename_map(stripped)
+                    state_dict[model_key] = self._to_bf16(tensor)
 
     def _process_fp8_pairs(self, fp8_pairs, state_dict):
         for base_name, pair in fp8_pairs.items():
