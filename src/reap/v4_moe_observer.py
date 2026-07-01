@@ -84,7 +84,7 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
         entry_block = self.blocks[0]
 
         captured_batches = []
-        embed = self.model.model.embed_tokens
+        embed = self.model.model.embed_tokens.to(target_device)
 
         def intercept_entry_inputs(_, args, kwargs):
             replay_kwargs = {}
