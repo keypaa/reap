@@ -25,7 +25,7 @@ Five stages, each gates the next. Stop and assess at each stage boundary.
 
 - Lightning AI account with billing set up
 - `lightning` CLI installed
-- HF token with read access (`huggingface-cli login` before starting)
+- HF token with read access (`hf auth login` before starting)
 - Your fork of `keypaa/reap` on GitHub (not upstream CerebrasResearch/reap)
 - SSH key added to Lightning AI
 
@@ -130,8 +130,8 @@ Expected: `CUDA: True, VRAM: 96`
 ### 1.3 — Download V4 Flash weights (~160 GB)
 
 ```bash
-huggingface-cli login  # if not already logged in
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash
+hf auth login  # if not already logged in
+hf download deepseek-ai/DeepSeek-V4-Flash
 ```
 
 **What to expect:** Downloads to HF cache. Takes 10-20 min depending on bandwidth. ~160 GB total (FP4+FP8 shards, quantized).
@@ -197,6 +197,38 @@ PYTHONPATH="src" python scripts/test_v4_one_layer.py
 - Timing > 120s per layer → something is wrong (maybe CPU→GPU transfer bottleneck)
 
 Write down the per-layer timing. You'll use it to estimate Stage 3 costs.
+
+### 2.3 — Actual CPU smoke test results (2026-07-01)
+
+Ran on Lightning AI CPU instance (no GPU) against DeepSeek-V4-Flash layer 0.
+
+**Command:**
+```bash
+PYTHONPATH="src" python scripts/test_v4_one_layer.py --device cpu --layer 0
+```
+
+**Results:**
+- Layer loaded successfully: 22 parameters materialized
+- Forward + observe: **4.24s** per layer on CPU
+- Estimated full 43-layer run: **~3 min** (optimistic, scales with samples × categories)
+
+**Fixes applied to `scripts/test_v4_one_layer.py`:**
+
+| Fix | Line | Why |
+|-----|------|-----|
+| Added `dtype=torch.bfloat16` to `hidden_3d` randn | 62 | CPU `F.linear` requires matching dtypes (float32 vs bfloat16). CUDA handles mixed-dtype automatically via implicit promotion; CPU does not. |
+| Moved `block.to("meta")` after benchmark | 69-81 | Benchmark re-ran `_process_moe_activations` after the block was already moved to meta, producing `Cannot copy out of meta tensor` error. The unload must happen after timing. |
+
+**CPU vs GPU extrapolation:**
+
+| Dataset | Samples | CPU Est. | GPU Target |
+|---------|---------|----------|------------|
+| seed-10k (3 cats, 10k samples) | ~1,250 batches | **~63 hrs** | ~7-10 min |
+| v1-full (10 cats, 23k samples) | ~2,875 batches | **~145 hrs** | ~16-23 min |
+| v1-filtered (10 cats, 21k samples) | ~2,625 batches | **~132 hrs** | ~15-21 min |
+| structured-outputs (1 cat, 430 samples) | ~54 batches | **~2.7 hrs** | ~30 sec |
+
+**Conclusion:** CPU is impractically slow for full runs. GPU (RTX PRO 6000) is expected to be ~500× faster. Use CPU only for component-level debugging.
 
 ---
 
@@ -407,7 +439,7 @@ PYTHONPATH="src" python -m reap.layerwise_prune \
 
 Upload pruned models to HF first for easier access:
 ```bash
-huggingface-cli upload <your-repo> results/DeepSeek-V4-Flash/reaper-calibration/layerwise_0.50_*/
+hf upload <your-repo> results/DeepSeek-V4-Flash/reaper-calibration/layerwise_0.50_*/
 ```
 
 Then run eval (fill in your actual eval datasets):

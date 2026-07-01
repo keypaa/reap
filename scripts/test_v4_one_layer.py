@@ -59,17 +59,12 @@ def main():
     hook_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__]()
     state = initialize_pruning_state(moe_block.experts.num_experts)
     observer = DeepseekV4MoEObserver(model, hook_config, v4_loader=v4_loader)
-    hidden_3d = torch.randn(1, 16, config.hidden_size, device=device)
+    hidden_3d = torch.randn(1, 16, config.hidden_size, device=device, dtype=torch.bfloat16)
     input_ids = torch.randint(0, config.vocab_size, (1, 16), device=device)
     observer._process_moe_activations(
         layer_idx, moe_block, hidden_3d, device, attention_mask=None, input_ids=input_ids,
     )
     print(f"Observer metrics computed")
-
-    # Unload
-    block.to("meta")
-    gc.collect()
-    print("=== PASSED ===")
 
     # Benchmark (observer only, excluding disk I/O)
     start = time.time()
@@ -77,10 +72,13 @@ def main():
         layer_idx, moe_block, hidden_3d, device, attention_mask=None, input_ids=input_ids,
     )
     elapsed = time.time() - start
-    block.to("meta")
-    gc.collect()
     print(f"Single forward+observe: {elapsed:.2f}s")
     print(f"Estimated 43 layers: {elapsed * 43 / 60:.1f} min")
+
+    # Unload
+    block.to("meta")
+    gc.collect()
+    print("=== PASSED ===")
 
 
 if __name__ == "__main__":

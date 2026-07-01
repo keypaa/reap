@@ -6,7 +6,7 @@
 
 **Tech Stack:** Lightning AI, transformers 5.13.0.dev0 (git main for V4), huggingface_hub 1.21.0, PyTorch 2.5+
 
-**Provider comparison:** Lightning AI ($1.46/hr spot, $2.80/hr on-demand). Use free CPU tier for setup, paid GPU only for execution.
+**Provider:** Lightning AI. Use free CPU tier for setup, paid GPU only for execution.
 
 ## Two Install Modes
 
@@ -22,7 +22,7 @@ The `--v4` flag skips CUDA-only deps (deepspeed, vllm) and installs transformers
 - No full-model `from_pretrained(device_map="cpu")` — 560 GB BF16 OOMs the 180 GB machine
 - All V4 pipeline code uses `V4BlockDiskLoader` for layer-at-a-time loading
 - Pruned model + tokenizer + config must produce coherent `generate()` output
-- All GPU costs listed use Lightning AI RTX PRO 6000 pricing ($1.46/hr spot)
+- All GPU costs use Lightning AI RTX PRO 6000 spot pricing ($1.46/hr)
 
 ## Stage 0: Free-Tier CPU Setup & Validation
 
@@ -157,7 +157,7 @@ import torch; print(f"CUDA: {torch.cuda.is_available()}, VRAM: {torch.cuda.get_d
 
 - [ ] **Download to cache (~160 GB, 10-20 min)**
 ```bash
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
+hf download deepseek-ai/DeepSeek-V4-Flash \
   --local-dir ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/latest
 ```
 
@@ -171,7 +171,7 @@ print(f"Layer map has {len(loader.layer_map)} layers")
 
 ## Stage 2: 1-Layer V4 Flash Smoke Test
 
-**Cost:** ~$0.02 (≈1 min on RTX PRO 6000 at $1.46/hr)
+**Cost:** ~$0.05 (≈2 min on RTX PRO 6000 spot at $1.46/hr)
 **Goal:** Load one V4 Flash decoder layer from disk, decompress FP4→BF16, run observer, compute metrics, prune, save.
 
 ### Task 2.1: Single-layer observer test
@@ -255,7 +255,7 @@ Expected: 128 experts.
 
 ## Stage 3: Full V4 Flash Observation
 
-**Cost:** ~$0.95 (39 min at $1.46/hr)
+**Cost:** TBD — measure per-layer time in Stage 2 first, then multiply by 43 layers × 3 runs
 **Goal:** Run all 43 layers with the full calibration dataset.
 
 ### Task 3.1: Verify weights cached
@@ -267,45 +267,53 @@ ls ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/lat
 
 ### Task 3.2: Run observation
 
-- [ ] **Run layerwise observation (3 separate runs — one per dataset)**
+- [ ] **Run layerwise observation (4 separate runs — one per dataset)**
 
 ```bash
-# Run 1: your dataset (10k subset)
+# Run 1: your dataset (10k subset, 3 categories)
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reaper-calibration[seed-10k]:200" \
-  --batch-size 4 \
-  --batches-per-category 64 \
+  --dataset-name "keypa/reaper-calibration[seed-10k]" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
   --model-max-length 16384 \
   --prune-method "reap" \
   --run-observer-only True
 
-# Run 2: Sero's full (includes refusals)
+# Run 2: Sero's full (10 categories, includes refusals)
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reap-calibration-v1-full:200" \
-  --batch-size 4 \
-  --batches-per-category 64 \
+  --dataset-name "keypa/reap-calibration-v1-full" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
   --model-max-length 16384 \
   --prune-method "reap" \
   --run-observer-only True
 
-# Run 3: Sero's filtered (no refusals)
+# Run 3: Sero's filtered (10 categories, no refusals)
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reap-calibration-v1-filtered:200" \
-  --batch-size 4 \
-  --batches-per-category 64 \
+  --dataset-name "keypa/reap-calibration-v1-filtered" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --run-observer-only True
+
+# Run 4: Structured outputs (430 samples, single "all" category)
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "0xSero/structured-outputs-calibration-v1" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
   --model-max-length 16384 \
   --prune-method "reap" \
   --run-observer-only True
 ```
 
-**Parameters:** batch-size 4 (14 GB VRAM/layer), batches-per-category 64 (~12K tokens), model-max-length 16384 (V4 native context), run-observer-only True.
+**Parameters:** batch-size 8 (~14 GB VRAM/layer), batches-per-category 1024 (safe upper bound — loop draws without replacement per category, stops when samples exhaust), model-max-length 16384 (V4 native context), run-observer-only True.
 
-**Cost:** 3 × 39 min = ~117 min GPU time ≈ $2.85 at spot pricing.
-
-**Expected runtime:** ~39 min (43 layers × ~50-55 sec).
+**Cost & runtime:** Unknown. No real V4 Flash benchmarks on this GPU exist. The per-layer time depends on category count (more categories = more forward passes per layer). Estimate 10-60 min per run but only measurement will tell.
 
 - [ ] **Monitor VRAM**
 ```bash
@@ -322,7 +330,7 @@ print(f"Layers: {len(data)}, Experts: {data[0]['expert_frequency'].shape[0]}")
 
 ## Stage 4: Full V4 Flash Prune + Eval
 
-**Cost:** ~$0.15-0.88 (prune 6 min + eval 15-30 min)
+**Cost:** Prune ~$0.44 (18 min × 3 at $1.46/hr). Eval TBD.
 **Goal:** Prune 50% of experts and evaluate.
 
 ### Task 4.1: Run pruning
@@ -333,7 +341,10 @@ print(f"Layers: {len(data)}, Experts: {data[0]['expert_frequency'].shape[0]}")
 # After Run 1
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reaper-calibration[seed-10k]:200" \
+  --dataset-name "keypa/reaper-calibration[seed-10k]" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
   --prune-method "reap" \
   --compression-ratio 0.5 \
   --run-observer-only False
@@ -341,7 +352,10 @@ python -m reap.layerwise_prune \
 # After Run 2
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reap-calibration-v1-full:200" \
+  --dataset-name "keypa/reap-calibration-v1-full" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
   --prune-method "reap" \
   --compression-ratio 0.5 \
   --run-observer-only False
@@ -349,7 +363,21 @@ python -m reap.layerwise_prune \
 # After Run 3
 python -m reap.layerwise_prune \
   --model-name "deepseek-ai/DeepSeek-V4-Flash" \
-  --dataset-name "keypa/reap-calibration-v1-filtered:200" \
+  --dataset-name "keypa/reap-calibration-v1-filtered" \
+  --batch-size 8 \
+  --batches-per-category 1024 \
+  --model-max-length 16384 \
+  --prune-method "reap" \
+  --compression-ratio 0.5 \
+  --run-observer-only False
+
+# After Run 4
+python -m reap.layerwise_prune \
+  --model-name "deepseek-ai/DeepSeek-V4-Flash" \
+  --dataset-name "0xSero/structured-outputs-calibration-v1" \
+  --batch-size 8 \
+  --batches-per-category 500 \
+  --model-max-length 16384 \
   --prune-method "reap" \
   --compression-ratio 0.5 \
   --run-observer-only False
@@ -383,15 +411,18 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 
 ## Cost Summary
 
-| Stage | Duration | GPU Time | Cost |
-|-------|----------|----------|------|
-| 0: CPU Setup & Test | ~30 min | — | $0 |
-| 1: GPU Setup + 160 GB download | ~60 min | — | $0* |
-| 2: 1-Layer Test | ~1 min | ~$0.02 | $0.02 |
-| 3: Full Observation (×3 datasets) | ~117 min | ~$2.85 | $2.85 |
-| 4a: Prune (×3 datasets) | ~18 min | ~$0.45 | $0.45 |
-| 4b: Eval (×3 models) | ~45-90 min | ~$1.08-2.19 | $1.08-2.19 |
-| **Total** | **~4.5 hrs** | **~3 hrs GPU** | **~$4.40-5.51** |
+| Stage | Notes | GPU Time | Cost ($1.46/hr) |
+|-------|-------|----------|-----------------|
+| 0: CPU Setup & Test | Free tier | — | $0 |
+| 1: GPU Setup + 160 GB download | Varies | — | $0 |
+| 2: 1-Layer Test | ~1 min | ~2 min | ~$0.05 |
+| 3a: Observation Run 1 (seed-10k, 3 cats) | Unknown — needs measurement | TBD | TBD |
+| 3b: Observation Run 2 (v1-full, 10 cats) | Unknown — needs measurement | TBD | TBD |
+| 3c: Observation Run 3 (v1-filtered, 10 cats) | Unknown — needs measurement | TBD | TBD |
+| 3d: Observation Run 4 (structured-outputs, 1 cat) | 430 samples, fast | TBD | TBD |
+| 4a: Prune (×4) | CPU-only, cheap | ~24 min | ~$0.58 |
+| 4b: Eval (×3 models) | Unknown — depends on eval size | TBD | TBD |
+| **Total** | **Will fill after Stage 2 benchmark** | **TBD** | **TBD** |
 
 \* Storage transfer between cloud regions may add ~$4-5.
 
@@ -405,11 +436,11 @@ Compare: expected <5% degradation at 50% compression (typical for REAP).
 | **deepspeed** | Not installed | Installed on GPU |
 | **transformers** | 5.13.0.dev0 (git main) | 5.13.0.dev0 (git main) |
 | **V4 weights** | Not downloaded | ~160 GB downloaded |
-| **Cost** | $0 | ~$1.50-1.85 |
+| **Cost** | $0 | TBD (Stage 2 benchmark needed) |
 
 ## Available Datasets
 
-Three calibration datasets are registered in the pipeline:
+Four calibration datasets are registered in the pipeline:
 
 | Dataset | Samples | Category | Fields | Format |
 |---------|---------|----------|--------|--------|
