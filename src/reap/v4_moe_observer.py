@@ -125,8 +125,12 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
 
                 hidden = embed(input_ids.to(target_device))  # [B, S, hidden]
                 hc_mult = getattr(self.model.config, "hc_mult", 1)
-                position_ids = torch.arange(input_ids.size(-1), dtype=torch.long, device=target_device).unsqueeze(0)
-                attention_mask = torch.ones_like(input_ids, device=target_device)
+                seq_len = input_ids.size(-1)
+                position_ids = torch.arange(seq_len, dtype=torch.long, device=target_device).unsqueeze(0)
+                # 4D causal mask [B, 1, S, S] — V4's compressor concatenates with 4D block_bias
+                causal_mask = torch.full((1, 1, seq_len, seq_len), 0.0, device=target_device, dtype=hidden.dtype)
+                causal_mask = torch.triu(causal_mask, diagonal=1).to(dtype=hidden.dtype) * torch.finfo(hidden.dtype).min
+                attention_mask = causal_mask
                 # Compute position_embeddings from the 3D hidden (before HC expansion)
                 # as the model does in DeepseekV4Model.forward
                 position_embeddings = {
