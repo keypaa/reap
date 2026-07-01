@@ -20,9 +20,40 @@
 
 ---
 
-# ⚠️ THE CRITICAL INSIGHT: Path Cost Per Sample
+# ⚠️ CORRECTION: This Pipeline Does NOT Do FP4 Inference
 
-Don't compare GPU cost/hr. Compare **cost per sample** — that's what actually matters.
+**Critical fact:** Every number in this document assumes weights are in **BF16 in VRAM**. The FP4 format is only a disk serialization format — it's decompressed to full BF16 before any computation touches it. There is no FP4 inference path here.
+
+The code proves this:
+```
+v4_block_loader.py:552-565 — load_into_block()
+  554: state_dict = self._build_layer_state_dict(layer_idx)
+       # ↑ calls dequantize_fp4_weight() → .to(torch.bfloat16)
+  558: block.to_empty(device=device)
+  560: block.load_state_dict(state_dict, assign=True)
+       # ↑ puts BF16 weights in .weight
+  564: block.to(device)
+       # ↑ BF16 on GPU; FP4 discarded
+```
+
+After `load_into_block`, `block.mlp.experts.gate_up_proj.weight` is a BF16 tensor `[256, 2*intermediate, hidden]`. **FP4 never reaches GPU memory.** It's a disk compression format only.
+
+**What this means for REAP:**
+- **Calibration is correct** — BF16 compute is BF16 compute. The activation statistics REAP collects are valid regardless of how weights were stored on disk.
+- **Calibration timing/VRAM numbers don't tell us about FP4-resident inference** — they measure BF16 weight residency, which is 4× the size of FP4.
+- **Pruning 50% of experts reduces VRAM, but not by the FP4 factor** — you go from 256 BF16 experts (14.4 GB/layer) to 128 BF16 experts (7.2 GB/layer). You don't get the additional 4× compression from FP4 because there's no fused dequant kernel.
+- **To get real FP4 inference savings**, you'd need a fused dequant matmul kernel (like bitsandbytes `Linear4bit`) that keeps FP4 in VRAM and dequantizes tile-by-tile during the matmul. This doesn't exist in our pipeline.
+
+**What this means for the numbers below:**
+- The cost-per-sample table compares **observation throughput** (dominated by attention compute, not weight loading). It is valid for comparing calibration costs across hardware.
+- VRAM figures throughout the doc are BF16-residency numbers. Halving the expert count (pruning) halves the weight VRAM, but never reaches FP4 density.
+- Post-pruning inference VRAM is a separate analysis requiring a fused dequant kernel. That is not scoped in this plan.
+
+---
+
+# Path Cost Per Sample (Observation Throughput Only)
+
+Don't compare GPU cost/hr. Compare **cost per sample** — that's what actually matters for calibration.
 
 | Path | HW | Samples/hr | Cost/hr | **Cost per 1,000 samples** | Paper Standard? |
 |---|---|---|---|---|---|
@@ -51,12 +82,10 @@ For all 4 datasets (48,912 samples):
 2. **B200 in layerwise mode is only 2-3× faster** than RTX PRO 6000 (memory bandwidth improvement, not compute) but costs **4× more per hour**.
 3. **Result: B200 processes fewer samples per dollar** than RTX PRO 6000 — it's slower per $, not faster.
 4. **Cannot reach paper standard** (12,228 at 16k) — layerwise has a fundamental 43× multiplier.
+5. **B200 doesn't fix the FP4 issue** — our pipeline decompresses FP4→BF16 on load regardless of GPU. B200's extra VRAM (179 GB vs 96 GB) doesn't buy FP4 inference because the pipeline never does FP4 inference. The weights would still be BF16 in VRAM.
+6. **Even with a fused FP4 kernel, B200 alone can't fit the full model** — 568 GB BF16-equivalent across 179 GB is impossible.
 
-**When WOULD B200 make sense?**
-- If you could keep ALL FP4 weights in VRAM (142 GB of 179 GB) AND run full-model forward (like vLLM does for serving)
-- This requires: custom CUDA kernels for on-the-fly FP4→BF16 dequant within each matmul
-- This is what vLLM does for DeepSeek-V3/R1 — but it's a massive engineering effort
-- Current vLLM doesn't support V4 Flash yet (as of July 2026)
+**The ONLY scenario where B200 helps:** You write a fused dequant kernel AND you're OK staying in layerwise mode. Then B200's 179 GB holds all FP4 weights (142 GB) + one dequantized layer + activations. But this is a ~2-3× speedup (no disk I/O) at 4× the cost — terrible ROI compared to 8× A100-80GB at $12/hr which gives full-model forward.
 
 **Conclusion:** B200 is a dead end for this project. Skip it entirely.
 
@@ -66,14 +95,16 @@ For all 4 datasets (48,912 samples):
 
 ### B200 Capacity Reality (For Reference Only — We're Not Using It)
 
-| Item | Size | Fits B200 (179 GB)? |
-|---|---|---|
-| FP4 weights (disk format) | ~142 GB | ✅ Yes, with 37 GB to spare |
-| BF16 weights (decompressed) | ~568 GB | ❌ No — need 4× B200 |
-| FP4 + KV cache (16k seq, bs=1) | ~142 + 25 GB = 167 GB | ✅ Marginal |
-| FP4 + activations (observation, bs=1) | ~142 + 15 GB = 157 GB | ✅ |
+**IMPORTANT:** All figures below assume the **naive dequant** model (BF16 weights in VRAM). FP4 format is disk-only — it is decompressed to BF16 before reaching GPU memory. There is no FP4-resident inference path.
 
-**Key constraint:** B200 alone cannot hold the full model in BF16.
+| Item | Size in VRAM (BF16) | Size if fused FP4 existed | Fits B200 (179 GB)? |
+|---|---|---|---|
+| Full model weights | 568 GB (BF16) | 142 GB (FP4) | ❌ BF16. ✅ FP4 (hypothetical). |
+| Single layer weights | ~14.4 GB (BF16) | ~3.6 GB (FP4) | ✅ Obviously |
+| Single layer + activations (8192 seq, bs=1) | ~14.4 + 15 GB = 29.4 GB | ~3.6 + 15 GB = 18.6 GB | ✅ |
+| Single layer + activations (16384 seq, bs=1) | ~14.4 + 30 GB = 44.4 GB | ~3.6 + 30 GB = 33.6 GB | ✅ |
+
+**Key constraint:** B200 alone cannot hold the full model in BF16. Our current pipeline only loads one layer at a time, so B200's extra VRAM isn't utilized for what matters most (full-model forward).
 
 ### Speed Bottleneck Reality
 
@@ -442,9 +473,10 @@ Can you accept ~500 samples at 8192 seq len for eval?
 | CUDA compute cap | 9.0 (Hopper) | 10.0 (Blackwell) | gen bump |
 | Flash attention | FA3 | FA4 | gen bump |
 | Cost/hr (spot) | ~$1.46 | ~$5-6 | 3.4-4.1× |
-| VRAM for FP4 weights | ❌ Cannot hold | ✅ Can hold (142 GB) | — |
 | **Cost per 1,000 samples** | **$23.17** | **$55.00** | **0.42× value** |
 
-B200 is NOT worth it for this workload. The 4× memory bandwidth is neutralized by the 4× higher cost and the fundamental 43× layerwise multiplier.
+**All figures assume naive BF16 dequant.** Neither GPU does FP4 inference in our pipeline. B200's extra VRAM (179 GB) would only matter if we either:
+- (a) Loaded the full model in BF16 (impossible — needs 568 GB), or
+- (b) Had a fused FP4→BF16 dequant kernel (doesn't exist in our pipeline)
 
-**The only scenario where B200 wins:** If and when vLLM adds native DeepSeek-V4-Flash support with on-the-fly FP4→BF16 dequantization within each matmul kernel. Then a single B200 could run full-model forward at FP4 precision (142 GB in 179 GB VRAM) without the 43× multiplier. As of July 2026, this doesn't exist yet.
+B200 is NOT worth it for this workload. The 4× memory bandwidth is neutralized by the 4× higher cost and the fundamental 43× layerwise multiplier.
