@@ -174,6 +174,9 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
         if block_idx < 0:
             return
         self.currently_loaded_block_idx = -1
+        block = self._block_at(block_idx)
+        if block is not None and self._v4_loader is not None:
+            block.to_empty(device="meta")
         if self._v4_loader is not None:
             self._v4_loader.close()
         cleanup_memory(synchronize=False)
