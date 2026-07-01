@@ -241,6 +241,9 @@ Ran into issues migrating from CPU smoke test to full GPU pipeline. Each fix was
 | 3 | `layerwise_prune.py:272` | Set default `chat_template` on tokenizer if missing | DeepSeek V4 tokenizer has no `chat_template`. `ChatDatasetProcessor.apply_chat_template()` fails without one. |
 | 4 | `v4_moe_observer.py:119` | Handle `BatchEncoding` in batch type check | Non-vLLM path produces `BatchEncoding` objects (from HF tokenizer), not `dict` or `Tensor`. |
 | 5 | `v4_moe_observer.py:87` | Move `embed` to `target_device` | `load_non_backbone_modules` leaves embed on CPU; forward pass on GPU fails with cross-device error. |
+| 6 | `v4_moe_observer.py:299` | Keep `total_tokens` on CPU to match state device | `valid_token_mask.sum()` returned CUDA tensor but `self.state[block_idx]["total_tokens"]` was initialized on CPU — `+=` cross-device error. |
+| 7 | `v4_block_loader.py:441` | Dequantize FP8 weights in compressor/indexer tensors | `_process_compressor_tensors` loaded `attn.indexer.q_b_proj.weight` raw as `Float8_e4m3fn` without applying its paired `.scale` — forward pass hit `BFloat16 != Float8_e4m3fn` matmul error. |
+| 8 | `v4_moe_observer.py:129` | Create 4D causal attention mask instead of 2D | V4 compressor concatenates `block_bias` (4D) to `attention_mask` via `torch.cat(..., dim=-1)` — 2D mask caused `got 2 and 4` RuntimeError in `modeling_deepseek_v4.py:842`. |
 
 ---
 
