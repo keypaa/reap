@@ -294,7 +294,7 @@ class DeepseekV4MoEObserver(LayerwiseMoEObserver):
 
         # Compute total valid tokens for this batch
         if valid_token_mask is not None:
-            total_tokens = valid_token_mask.sum()
+            total_tokens = valid_token_mask.sum().cpu()
         else:
             total_tokens = torch.tensor(flat_input.shape[0], device="cpu", dtype=torch.long)
         self.state[block_idx]["total_tokens"] += total_tokens
