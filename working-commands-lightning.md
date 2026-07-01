@@ -230,6 +230,18 @@ PYTHONPATH="src" python scripts/test_v4_one_layer.py --device cpu --layer 0
 
 **Conclusion:** CPU is impractically slow for full runs. GPU (RTX PRO 6000) is expected to be ~500× faster. Use CPU only for component-level debugging.
 
+### 2.4 — Fixes Applied During GPU Bringup (2026-07-01)
+
+Ran into issues migrating from CPU smoke test to full GPU pipeline. Each fix was committed to `keypaa/reap`.
+
+| # | File | Fix | Why |
+|---|------|-----|-----|
+| 1 | `v4_block_loader.py:539` | Added `block.to(device)` after `load_state_dict(assign=True)` | `assign=True` replaces CUDA meta tensors with CPU state_dict tensors. Gate weights ended up on CPU, causing `F.linear` device mismatch on GPU. |
+| 2 | `data.py:212-222` | Parse `[subset]` from dataset name (e.g. `keypa/reaper-calibration[seed-10k]` → name + subset) | Single-dataset path didn't strip `[subset]` notation, causing `HFValidationError` and registry lookup failure. |
+| 3 | `layerwise_prune.py:272` | Set default `chat_template` on tokenizer if missing | DeepSeek V4 tokenizer has no `chat_template`. `ChatDatasetProcessor.apply_chat_template()` fails without one. |
+| 4 | `v4_moe_observer.py:119` | Handle `BatchEncoding` in batch type check | Non-vLLM path produces `BatchEncoding` objects (from HF tokenizer), not `dict` or `Tensor`. |
+| 5 | `v4_moe_observer.py:87` | Move `embed` to `target_device` | `load_non_backbone_modules` leaves embed on CPU; forward pass on GPU fails with cross-device error. |
+
 ---
 
 ## Stage 3: Full V4 Flash Observation
