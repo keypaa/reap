@@ -52,8 +52,8 @@ The REAP paper ran on Cerebras CS-3 (wafer-scale) — the full model runs as one
 
 | Setup | Total VRAM | Full model forward? | Est. time for 12,228 batches at 16k |
 |---|---|---|---|
-| 8× A100 80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~30-45 min |
-| 8× H100 80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~20-30 min |
+| 8× A100-80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~30-45 min |
+| 8× H100-80GB (NVLink) | 640 GB | ✅ (BF16, TP=8) | ~20-30 min |
 | 2× B200 (NVLink) | 358 GB | ✅ (FP8, TP=2) | ~40-60 min |
 | 1× B200 | 179 GB | ❌ (BF16 OOM) | N/A |
 
@@ -273,7 +273,7 @@ Same command as current but with VRAM loader. Check:
 
 ## Path C: Multi-GPU Full-Model Forward (~100× Speedup)
 
-**Cost:** $10-30/hr (8× A100 on runpod/vast)
+**Cost:** $10-30/hr (8× A100-80GB on runpod/vast)
 **Feasible scale:** ~12,228 samples at 16,384 seq len in ~30-60 min
 **Status:** Major engineering effort — needs vLLM integration or tensor parallelism
 
@@ -285,14 +285,14 @@ The core issue: even with all FP4 weights in VRAM (Path B), layerwise requires 4
 2. Run ONE forward pass per batch through all 43 layers
 3. Register standard MoE hooks (not layerwise replay cache)
 
-One forward pass for 284B on 8× A100: ~0.15-0.3 seconds at 16k seq len.
+One forward pass for 284B on 8× A100-80GB: ~0.15-0.3 seconds at 16k seq len.
 12,228 batches × 0.3s = ~1 hour.
 
 ### Task C1: Determine Best Multi-GPU Platform
 
 **Research — no code:**
 
-- [ ] Compare: runpod (8× A100-80GB, ~$13-20/hr), vast.ai (8× A100, ~$10-15/hr), Lambda Labs (8× A100, ~$15/hr)
+- [ ] Compare: runpod (8× A100-80GB, ~$13-20/hr), vast.ai (8× A100-80GB, ~$10-15/hr), Lambda Labs (8× A100-80GB, ~$15/hr)
 - [ ] Check: does runpod have B200 clusters? (likely not yet)
 - [ ] Check: does vast.ai offer 2×B200 instances? (NVLink required for TP)
 - [ ] Report: cheapest platform with NVLink-connected GPUs
@@ -334,7 +334,7 @@ If vLLM is not usable:
 - No changes — run existing pipeline if adapted
 
 **Verification:**
-- [ ] Load DeepSeek-V4-Flash on 8× A100 with device_map="auto"
+- [ ] Load DeepSeek-V4-Flash on 8× A100-80GB with device_map="auto"
 - [ ] Run 1 batch: verify all 43 layers' metrics collected
 - [ ] Run 1228 batches (10% of 12,228): measure time, verify no OOM
 - [ ] Project full 12,228 time from measured throughput
@@ -359,8 +359,8 @@ Pruning (weight removal) is much simpler than observation — it's just weight t
 |---|---|---|---|---|---|
 | **A** (current) | RTX PRO 6000 | 500 at 8192 | 8 hrs | $11.68 | ❌ (4% coverage) |
 | **B** (B200 layerwise) | 1× B200 | 1,000 at 8192 | 10 hrs | $50-60 | ❌ (8% coverage) |
-| **C** (multi-GPU) | 8× A100 | 12,228 at 16384 | 1 hr | $13-20 | ✅ Full |
-| **C** (multi-GPU, 4 datasets) | 8× A100 | 48,912 total | 4 hrs | $52-80 | ✅ Full |
+| **C** (multi-GPU) | 8× A100-80GB | 12,228 at 16384 | 1 hr | $13-20 | ✅ Full |
+| **C** (multi-GPU, 4 datasets) | 8× A100-80GB | 48,912 total | 4 hrs | $52-80 | ✅ Full |
 
 ### Observation + Prune + Eval (4 Datasets)
 
@@ -433,7 +433,7 @@ If Path C:
 4. Research vLLM hooks or accelerate-based loading for V4 (Task C2)
 5. Remove V4 guard in main.py (Task C3)
 6. Test on 1 GPU with small batch first
-7. Rent 8× A100 for the run
+7. Rent 8× A100-80GB for the run
 
 ---
 
